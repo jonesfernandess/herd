@@ -1,5 +1,7 @@
 # Herd
 
+![Herd screenshot](docs/screenshots/claudes.png)
+
 Herd is a Tauri desktop app for managing terminal work as a spatial canvas instead of a stack of tabs. It runs an isolated `tmux` server, projects shells into a zoomable 2D workspace, and exposes a local socket + MCP bridge so agents can spawn and control more shells from inside Herd.
 
 ## What It Does
@@ -13,7 +15,7 @@ Herd is a Tauri desktop app for managing terminal work as a spatial canvas inste
 
 ## Current Runtime Model
 
-Herd is in the middle of a tmux-authoritative refactor. The current codebase behaves like this:
+Herd currently behaves like this:
 
 - Herd starts its own isolated tmux server with `tmux -f /dev/null -L herd`
 - The frontend hydrates from backend `TmuxSnapshot` updates
@@ -21,8 +23,6 @@ Herd is in the middle of a tmux-authoritative refactor. The current codebase beh
 - Herd owns only presentation state such as tile positions, canvas zoom/pan, overlays, and local UI mode
 - UI tabs currently map to tmux sessions
 - Visible shell tiles currently map to single-pane tmux windows, with some compatibility APIs still referring to pane IDs as `session_id`
-
-If you are changing topology behavior, read [`prd/2026_03_18_tmux_authoritative_state_refactor_prd.md`](/Users/skryl/Dev/herd/prd/2026_03_18_tmux_authoritative_state_refactor_prd.md) first.
 
 ## Stack
 
@@ -218,6 +218,32 @@ Available MCP tools:
 
 The app must be running before the MCP server can connect successfully.
 
+## Claude Integration
+
+Claude works best when it is launched inside a Herd shell, not from an unrelated terminal.
+
+- Herd runs shells inside its own isolated tmux server: `tmux -f /dev/null -L herd`
+- Herd injects `HERD_SOCK=/tmp/herd.sock` into shells it creates, so processes inside those shells can call back into Herd
+- If you start Claude with `claude --teammate-mode tmux`, Claude uses tmux as its team runtime
+- Herd watches that same tmux server through control mode and rebuilds the UI from tmux snapshots
+- When Claude creates teammate terminals through tmux, Herd sees the new tmux topology and renders those teammates as additional shells on the canvas
+
+In practice, the flow looks like this:
+
+1. Open a shell in Herd.
+2. Start Claude in that shell with `claude --teammate-mode tmux`.
+3. Ask Claude to create teammates.
+4. Claude creates more tmux terminals.
+5. Herd detects the tmux changes and shows the teammates as new terminal tiles.
+
+This is the important boundary:
+
+- tmux is the shared runtime and process topology layer
+- Herd is the visual shell manager that projects tmux state onto the canvas
+- `HERD_SOCK` and the MCP bridge are optional control paths available from inside those tmux shells when Claude or its teammates need to ask Herd to spawn or manipulate shells directly
+
+The end-to-end test in [`test-e2e.ts`](/Users/skryl/Dev/herd/test-e2e.ts) includes a Claude teammate-mode flow if you want a concrete example.
+
 ## Testing
 
 Static checks and unit tests:
@@ -247,10 +273,3 @@ npx tsx test-e2e.ts
 - [`src-tauri/`](/Users/skryl/Dev/herd/src-tauri): Rust backend and Tauri app
 - [`mcp-server/`](/Users/skryl/Dev/herd/mcp-server): stdio MCP bridge
 - [`bin/`](/Users/skryl/Dev/herd/bin): helper scripts and integration test utilities
-- [`prd/`](/Users/skryl/Dev/herd/prd): product and refactor notes
-
-## Notes
-
-- The original scaffold PRD is in [`prd/2026_03_13_tauri_canvas_terminal_scaffold_prd.md`](/Users/skryl/Dev/herd/prd/2026_03_13_tauri_canvas_terminal_scaffold_prd.md).
-- The current refactor direction is captured in [`prd/2026_03_18_tmux_authoritative_state_refactor_prd.md`](/Users/skryl/Dev/herd/prd/2026_03_18_tmux_authoritative_state_refactor_prd.md).
-- `TODO.md` tracks a few near-term ideas such as libghostty and window snapping.
