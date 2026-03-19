@@ -194,8 +194,11 @@ pub fn rename_session(app: tauri::AppHandle, session_id: String, name: String) -
     Ok(())
 }
 
-#[tauri::command]
-pub fn new_window(app: tauri::AppHandle, target_session_id: Option<String>) -> Result<String, String> {
+fn new_window_internal(
+    app: tauri::AppHandle,
+    target_session_id: Option<String>,
+    select_new_window: bool,
+) -> Result<String, String> {
     let state = app.state::<AppState>();
     let before = tmux_state::snapshot(state.inner())?;
     let session_id = target_session_id.unwrap_or(active_session_id(&before)?);
@@ -210,9 +213,20 @@ pub fn new_window(app: tauri::AppHandle, target_session_id: Option<String>) -> R
         .map(|pane| pane.window_id.clone())
         .ok_or("tmux did not report the new window for the created pane")?;
 
-    tmux_state::select_window(&window_id)?;
+    if select_new_window {
+        tmux_state::select_window(&window_id)?;
+    }
     tmux_state::emit_snapshot(&app)?;
     Ok(window_id)
+}
+
+#[tauri::command]
+pub fn new_window(app: tauri::AppHandle, target_session_id: Option<String>) -> Result<String, String> {
+    new_window_internal(app, target_session_id, true)
+}
+
+pub fn new_window_detached(app: tauri::AppHandle, target_session_id: Option<String>) -> Result<String, String> {
+    new_window_internal(app, target_session_id, false)
 }
 
 #[tauri::command]
@@ -229,7 +243,7 @@ pub fn split_pane(app: tauri::AppHandle, target_pane_id: Option<String>) -> Resu
     } else {
         active_session_id(&snapshot)?
     };
-    new_window(app, Some(session_id))
+    new_window_internal(app, Some(session_id), true)
 }
 
 #[tauri::command]
@@ -311,7 +325,7 @@ pub fn set_pane_title(app: tauri::AppHandle, pane_id: String, title: String) -> 
 // Compatibility alias: create a new single-pane tmux window in the active session.
 #[tauri::command]
 pub fn create_pty(app: tauri::AppHandle, _cols: u16, _rows: u16) -> Result<String, String> {
-    let window_id = new_window(app.clone(), None)?;
+    let window_id = new_window_internal(app.clone(), None, true)?;
     let state = app.state::<AppState>();
     let snapshot = tmux_state::snapshot(state.inner())?;
     snapshot

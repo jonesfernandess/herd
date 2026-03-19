@@ -162,12 +162,29 @@ impl TmuxControl {
                     .ok()
             ));
 
-            let reader = BufReader::new(reader);
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l.trim_end_matches('\r').to_string(),
-                    Err(_) => break,
+            let mut reader = BufReader::new(reader);
+            let mut raw_line = Vec::new();
+            loop {
+                raw_line.clear();
+                let read = match reader.read_until(b'\n', &mut raw_line) {
+                    Ok(0) => {
+                        log::warn!("tmux -CC reader reached EOF for pid {child_pid}");
+                        log_child_exit_status(child_pid);
+                        break;
+                    }
+                    Ok(read) => read,
+                    Err(error) => {
+                        log::error!("tmux -CC reader error for pid {child_pid}: {error}");
+                        log_child_exit_status(child_pid);
+                        break;
+                    }
                 };
+
+                if read == 0 {
+                    continue;
+                }
+
+                let line = control_line_from_bytes(&raw_line);
 
                 // Log all -CC lines to file
                 if !line.is_empty() {
@@ -372,6 +389,30 @@ fn kill_stale_control_clients(current_pid: libc::pid_t) {
     }
 }
 
+fn control_line_from_bytes(bytes: &[u8]) -> String {
+    let line = String::from_utf8_lossy(bytes);
+    line.trim_end_matches('\n').trim_end_matches('\r').to_string()
+}
+
+fn log_child_exit_status(child_pid: libc::pid_t) {
+    let mut status: libc::c_int = 0;
+    let wait_result = unsafe { libc::waitpid(child_pid, &mut status as *mut libc::c_int, libc::WNOHANG) };
+    if wait_result == child_pid {
+        if libc::WIFEXITED(status) {
+            log::warn!("tmux -CC child {child_pid} exited with status {}", libc::WEXITSTATUS(status));
+        } else if libc::WIFSIGNALED(status) {
+            log::warn!("tmux -CC child {child_pid} terminated by signal {}", libc::WTERMSIG(status));
+        } else {
+            log::warn!("tmux -CC child {child_pid} exited with status word {status}");
+        }
+    } else if wait_result == 0 {
+        log::warn!("tmux -CC child {child_pid} is still running after reader exit");
+    } else {
+        let error = std::io::Error::last_os_error();
+        log::warn!("waitpid failed while checking tmux -CC child {child_pid}: {error}");
+    }
+}
+
 /// Parse a %output line: "%output %<pane_id> <data>"
 fn parse_output_line(line: &str) -> Option<(String, String)> {
     // Format: "%output %N <data>"
@@ -420,7 +461,7 @@ fn decode_tmux_output(data: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_session_changed_id;
+    use super::{control_line_from_bytes, parse_session_changed_id};
 
     #[test]
     fn parses_session_changed_events() {
@@ -433,5 +474,11 @@ mod tests {
             Some("$1".to_string())
         );
         assert_eq!(parse_session_changed_id("%layout-change @1 ..."), None);
+    }
+
+    #[test]
+    fn decodes_control_lines_lossily() {
+        assert_eq!(control_line_from_bytes(b"%layout-change @1\r\n"), "%layout-change @1");
+        assert!(control_line_from_bytes(&[b'%', 0xff, b'\n']).starts_with('%'));
     }
 }

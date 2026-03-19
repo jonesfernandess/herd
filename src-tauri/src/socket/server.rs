@@ -302,7 +302,7 @@ fn handle_command(
                         .map(|pane| pane.window_id.clone())
                 });
 
-            match crate::commands::new_window(app.clone(), target_session_id) {
+            match crate::commands::new_window_detached(app.clone(), target_session_id) {
                 Ok(window_id) => {
                     if let Some(parent_window_id) = parent_window_id.clone() {
                         state.set_window_parent(&window_id, Some(parent_window_id));
@@ -366,6 +366,16 @@ fn handle_command(
         SocketCommand::SendInput { session_id, input } => {
             match state.with_control(|ctrl| ctrl.writer.send_input_by_id(&session_id, input.as_bytes())) {
                 Ok(()) => SocketResponse::success(None),
+                Err(e) => SocketResponse::error(e),
+            }
+        }
+
+        SocketCommand::ExecInShell { session_id, shell_command } => {
+            match crate::tmux_state::respawn_pane_shell_command(&session_id, &shell_command) {
+                Ok(()) => {
+                    let _ = crate::tmux_state::emit_snapshot(app);
+                    SocketResponse::success(None)
+                }
                 Err(e) => SocketResponse::error(e),
             }
         }

@@ -136,6 +136,8 @@ pub enum SocketCommand {
     ListShells,
     #[serde(rename = "send_input")]
     SendInput { session_id: String, input: String },
+    #[serde(rename = "exec_in_shell")]
+    ExecInShell { session_id: String, shell_command: String },
     #[serde(rename = "read_output")]
     ReadOutput { session_id: String },
     #[serde(rename = "set_title")]

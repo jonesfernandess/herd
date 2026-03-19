@@ -538,6 +538,25 @@ pub fn respawn_window(window_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn respawn_pane_shell_command(pane_id: &str, command: &str) -> Result<(), String> {
+    let herd_sock = format!("HERD_SOCK={}", runtime::socket_path());
+    ensure_success(
+        run_tmux(&[
+            "respawn-pane",
+            "-k",
+            "-t",
+            pane_id,
+            "-e",
+            &herd_sock,
+            "/bin/bash",
+            "-lc",
+            command,
+        ])?,
+        "tmux respawn-pane failed",
+    )?;
+    Ok(())
+}
+
 pub fn kill_session(session_id: &str) -> Result<(), String> {
     ensure_success(run_tmux(&["kill-session", "-t", session_id])?, "tmux kill-session failed")?;
     Ok(())

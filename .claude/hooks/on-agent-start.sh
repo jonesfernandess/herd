@@ -19,12 +19,13 @@ emit('AGENT_NAME', ti.get('name', ''))
 emit('TEAM_NAME', ti.get('team_name', ''))
 emit('AGENT_PROMPT', ti.get('prompt', ''))
 emit('AGENT_DESC', ti.get('description', ''))
-emit('LEGACY_SUBAGENT_TYPE', ti.get('subagent_type', ''))
+emit('SUBAGENT_TYPE', ti.get('subagent_type', ''))
 emit('MODEL', ti.get('model', ''))
-emit('TRANSCRIPT', d.get('transcript_path', ''))
-emit('SESSION_ID', d.get('session_id', ''))
+emit('TRANSCRIPT', d.get('transcript_path') or d.get('transcriptPath', ''))
+emit('SESSION_ID', d.get('session_id') or d.get('sessionId', ''))
 emit('CWD', d.get('cwd', ''))
-emit('PERMISSION_MODE', d.get('permission_mode', ''))
+emit('PERMISSION_MODE', d.get('permission_mode') or d.get('permissionMode', ''))
+emit('TOOL_USE_ID', d.get('tool_use_id') or d.get('toolUseID') or d.get('toolUseId', ''))
 " 2>/dev/null)" || { echo '{"continue": true}'; exit 0; }
 
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -34,7 +35,24 @@ if [ -z "$PARENT_PANE_ID" ] && [[ "$SESSION_ID" == %* ]]; then
 fi
 
 socket_request() {
-  printf '%s\n' "$1" | socat - UNIX-CONNECT:"$HERD_SOCK" 2>/dev/null
+  python3 - "$HERD_SOCK" "$1" <<'PY' 2>/dev/null
+import socket, sys
+
+sock_path, payload = sys.argv[1], sys.argv[2]
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.connect(sock_path)
+client.sendall((payload + "\n").encode("utf-8"))
+
+buffer = b""
+while b"\n" not in buffer:
+    chunk = client.recv(65536)
+    if not chunk:
+        break
+    buffer += chunk
+
+client.close()
+sys.stdout.write(buffer.decode("utf-8", "replace").strip())
+PY
 }
 
 spawn_tile() {
@@ -90,6 +108,16 @@ print(json.dumps({"command": "send_input", "session_id": sid, "input": command_i
 ' "$sid" "$command_input" 2>/dev/null)" >/dev/null 2>&1
 }
 
+exec_tile_command() {
+  local sid="$1"
+  local command_input="$2"
+  socket_request "$(python3 -c '
+import json, sys
+sid, command_input = sys.argv[1], sys.argv[2]
+print(json.dumps({"command": "exec_in_shell", "session_id": sid, "shell_command": command_input}))
+' "$sid" "$command_input" 2>/dev/null)" >/dev/null 2>&1
+}
+
 resolve_claude_bin() {
   if [ -n "${HERD_CLAUDE_AGENT_BIN:-}" ]; then
     printf '%s' "$HERD_CLAUDE_AGENT_BIN"
@@ -139,6 +167,52 @@ for color in palette:
 
 print(palette[len(members) % len(palette)])
 ' "$TEAM_NAME" "$AGENT_NAME" 2>/dev/null
+}
+
+resolve_parent_session_id() {
+  if [ -n "$SESSION_ID" ]; then
+    printf '%s' "$SESSION_ID"
+    return
+  fi
+
+  if [ -n "$TRANSCRIPT" ]; then
+    basename "$TRANSCRIPT" .jsonl
+    return
+  fi
+}
+
+slugify_text() {
+  python3 -c '
+import re, sys
+text = sys.argv[1].strip().lower()
+slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+print(slug[:40] or "agent")
+' "$1" 2>/dev/null
+}
+
+shell_quote() {
+  python3 -c '
+import shlex, sys
+print(shlex.quote(sys.argv[1]))
+' "$1" 2>/dev/null
+}
+
+generic_agent_name() {
+  local base short_tool
+  base="$(slugify_text "${SUBAGENT_TYPE:-${AGENT_DESC:-${AGENT_PROMPT:-agent}}}")"
+  short_tool="$(printf '%s' "${TOOL_USE_ID:-agent}" | tr -cd '[:alnum:]' | tail -c 8)"
+  if [ -n "$short_tool" ]; then
+    printf '%s-%s' "$base" "$short_tool"
+  else
+    printf '%s' "$base"
+  fi
+}
+
+generic_team_name() {
+  local parent_id short_parent
+  parent_id="$(resolve_parent_session_id)"
+  short_parent="$(printf '%s' "${parent_id:-session}" | tr -cd '[:alnum:]' | head -c 8)"
+  printf 'adhoc-%s' "${short_parent:-session}"
 }
 
 launch_team_agent_tile() {
@@ -195,37 +269,99 @@ print(" && ".join(parts) + "\n")
     "${permission_flags[@]}" \
     "${model_flags[@]}" 2>/dev/null)"
 
-  [ -n "$launch_command" ] && send_tile_input "$sid" "$launch_command"
+  [ -n "$launch_command" ] && exec_tile_command "$sid" "$launch_command"
 }
 
-launch_legacy_transcript_tile() {
-  local sid title subagent_dir command_input
+launch_generic_agent_tile() {
+  local sid title generic_label claude_bin agent_name team_name agent_color parent_session_id launch_command attach_command
+  local permission_flags model_flags test_marker
+  local q_cwd q_test_marker q_resolve q_transcript q_tool_use_id q_claude_bin arg
 
   sid="$1"
-  title="${LEGACY_SUBAGENT_TYPE:-Agent}: ${AGENT_PROMPT:0:60}"
+  generic_label="${AGENT_DESC:-${AGENT_PROMPT:-Agent}}"
+  title="${SUBAGENT_TYPE:-Agent}: ${generic_label:0:60}"
   set_tile_title "$sid" "$title"
 
-  socket_request "$(python3 -c '
-import json, sys
-sid = sys.argv[1]
-print(json.dumps({"command": "set_read_only", "session_id": sid, "read_only": True}))
-' "$sid" 2>/dev/null)" >/dev/null 2>&1
+  claude_bin="$(resolve_claude_bin)"
+  [ -z "$claude_bin" ] && return
 
-  if [ -n "$TRANSCRIPT" ]; then
-    subagent_dir="$(dirname "$TRANSCRIPT")/subagents"
-    command_input="echo 'Waiting for agent transcript...'; while [ ! -d '${subagent_dir}' ]; do sleep 0.3; done; LATEST=''; while [ -z \"\$LATEST\" ]; do LATEST=\$(ls -t '${subagent_dir}'/*.jsonl 2>/dev/null | head -1); sleep 0.3; done; echo \"Tailing \$LATEST\"; tail -f -n +1 \"\$LATEST\" | python3 '${HOOKS_DIR}/stream-transcript.py'"
-    send_tile_input "$sid" "${command_input}"$'\n'
+  parent_session_id="$(resolve_parent_session_id)"
+  [ -z "$parent_session_id" ] && return
+  [ -z "$TRANSCRIPT" ] && return
+  [ -z "$TOOL_USE_ID" ] && return
+
+  agent_name="$(generic_agent_name)"
+  team_name="$(generic_team_name)"
+  agent_color="blue"
+
+  permission_flags=()
+  if [ "$PERMISSION_MODE" = "bypassPermissions" ]; then
+    permission_flags+=("--dangerously-skip-permissions")
+  elif [ -n "$PERMISSION_MODE" ]; then
+    permission_flags+=("--permission-mode" "$PERMISSION_MODE")
   fi
+
+  model_flags=()
+  if [ -n "$MODEL" ]; then
+    model_flags+=("--model" "$MODEL")
+  fi
+
+  test_marker=""
+  if [ -n "${HERD_CLAUDE_AGENT_BIN:-}" ]; then
+    test_marker="__HERD_AGENT_LAUNCH__ generic ${agent_name} ${team_name} ${agent_color} ${parent_session_id} ${TOOL_USE_ID} ${PERMISSION_MODE:-default} ${MODEL:-default}"
+  fi
+
+  q_cwd="$(shell_quote "$CWD")"
+  q_resolve="$(shell_quote "${HOOKS_DIR}/resolve-agent-id.py")"
+  q_transcript="$(shell_quote "$TRANSCRIPT")"
+  q_tool_use_id="$(shell_quote "$TOOL_USE_ID")"
+  q_claude_bin="$(shell_quote "$claude_bin")"
+
+  attach_command="${q_claude_bin} --agent-id \"\$AGENT_ID\""
+  for arg in \
+    --agent-name "$agent_name" \
+    --team-name "$team_name" \
+    --agent-color "$agent_color" \
+    --parent-session-id "$parent_session_id" \
+    "${permission_flags[@]}" \
+    "${model_flags[@]}"; do
+    attach_command="${attach_command} $(shell_quote "$arg")"
+  done
+
+  launch_command="cd ${q_cwd} || exit 1"
+  launch_command="${launch_command}; printf '%s\\n' 'Waiting for agent session id...'"
+  launch_command="${launch_command}; AGENT_ID=\"\$(python3 ${q_resolve} ${q_transcript} ${q_tool_use_id})\" || exit 1"
+  launch_command="${launch_command}; [ -n \"\$AGENT_ID\" ] || { echo 'Failed to resolve agent id'; exit 1; }"
+  if [ -n "$test_marker" ]; then
+    q_test_marker="$(shell_quote "$test_marker")"
+    launch_command="${launch_command}; printf '%s\\n' ${q_test_marker} \"\$AGENT_ID\""
+  fi
+  launch_command="${launch_command}; ATTACH_RETRY_COUNT=0"
+  launch_command="${launch_command}; while true; do ATTACH_START=\$(date +%s); ${attach_command}; ATTACH_STATUS=\$?; ATTACH_END=\$(date +%s); ATTACH_DURATION=\$((ATTACH_END - ATTACH_START)); if [ \"\$ATTACH_DURATION\" -ge 2 ]; then exit \"\$ATTACH_STATUS\"; fi; ATTACH_RETRY_COUNT=\$((ATTACH_RETRY_COUNT + 1)); if [ \"\$ATTACH_RETRY_COUNT\" -ge 30 ]; then echo 'Failed to attach to agent session after retries.'; exit \"\$ATTACH_STATUS\"; fi; echo 'Retrying agent attach...'; sleep 1; done"
+
+  [ -n "$launch_command" ] && exec_tile_command "$sid" "$launch_command"
 }
+
+HOOK_MODE=""
+if [ -n "$AGENT_NAME" ] && [ -n "$TEAM_NAME" ] && [ -n "$SESSION_ID" ]; then
+  HOOK_MODE="team"
+elif [ -n "$TRANSCRIPT" ] && [ -n "$TOOL_USE_ID" ] && [ -n "$SESSION_ID" ]; then
+  HOOK_MODE="generic"
+fi
+
+if [ -z "$HOOK_MODE" ]; then
+  echo '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"Herd skipped unsupported agent payload"}}'
+  exit 0
+fi
 
 RESPONSE="$(spawn_tile)"
 SID="$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('session_id',''))" 2>/dev/null)"
 
 if [ -n "$SID" ]; then
-  if [ -n "$AGENT_NAME" ] && [ -n "$TEAM_NAME" ] && [ -n "$SESSION_ID" ]; then
+  if [ "$HOOK_MODE" = "team" ]; then
     launch_team_agent_tile "$SID"
   else
-    launch_legacy_transcript_tile "$SID"
+    launch_generic_agent_tile "$SID"
   fi
 fi
 

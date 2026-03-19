@@ -30,7 +30,24 @@ print(f'DESC={shlex.quote(desc[:50])}')
 PARENT_PANE_ID="${TMUX_PANE:-}"
 
 socket_request() {
-  printf '%s\n' "$1" | socat - UNIX-CONNECT:"$HERD_SOCK" 2>/dev/null
+  python3 - "$HERD_SOCK" "$1" <<'PY' 2>/dev/null
+import socket, sys
+
+sock_path, payload = sys.argv[1], sys.argv[2]
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.connect(sock_path)
+client.sendall((payload + "\n").encode("utf-8"))
+
+buffer = b""
+while b"\n" not in buffer:
+    chunk = client.recv(65536)
+    if not chunk:
+        break
+    buffer += chunk
+
+client.close()
+sys.stdout.write(buffer.decode("utf-8", "replace").strip())
+PY
 }
 
 spawn_tile() {
