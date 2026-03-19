@@ -25,8 +25,11 @@ cmd = ti.get('command', '')
 desc = ti.get('description', cmd[:40])
 print(f'CMD={shlex.quote(cmd)}')
 print(f'DESC={shlex.quote(desc[:50])}')
+print(f'TRANSCRIPT={shlex.quote(str(d.get(\"transcript_path\") or d.get(\"transcriptPath\") or \"\"))}')
+print(f'TOOL_USE_ID={shlex.quote(str(d.get(\"tool_use_id\") or d.get(\"toolUseID\") or d.get(\"toolUseId\") or \"\"))}')
 " 2>/dev/null)" || { echo '{"continue": true}'; exit 0; }
 
+HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
 PARENT_PANE_ID="${TMUX_PANE:-}"
 
 socket_request() {
@@ -112,12 +115,26 @@ print(json.dumps({"command": "send_input", "session_id": sid, "input": command_i
 ' "$sid" "$command_input" 2>/dev/null)" >/dev/null 2>&1
 }
 
+start_task_watcher() {
+  local sid="$1"
+  [ -z "$sid" ] && return
+  [ -z "$TRANSCRIPT" ] && return
+  [ -z "$TOOL_USE_ID" ] && return
+
+  nohup python3 "${HOOKS_DIR}/watch-agent-task.py" \
+    "$TRANSCRIPT" \
+    "$TOOL_USE_ID" \
+    "$HERD_SOCK" \
+    "$sid" >/dev/null 2>&1 &
+}
+
 RESPONSE="$(spawn_tile)"
 SID=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('session_id',''))" 2>/dev/null)
 
 if [ -n "$SID" ]; then
   set_tile_title "$SID" "BG: $DESC"
   set_tile_read_only "$SID"
+  start_task_watcher "$SID"
   send_tile_input "$SID" "echo Running: $CMD"$'\n'
 fi
 

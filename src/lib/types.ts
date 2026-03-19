@@ -20,6 +20,8 @@ export interface CanvasState {
   zoom: number;
 }
 
+export type ArrangementMode = 'circle' | 'snowflake' | 'stack-down' | 'stack-right' | 'spiral';
+
 export type CanvasZoomMode = 'focused' | 'fullscreen';
 
 export interface CanvasZoomBookmark {
@@ -123,6 +125,7 @@ export interface UiState {
   selectedPaneId: string | null;
   paneViewportHints: Record<string, PaneViewportHint>;
   arrangementCycleBySession: Record<string, number>;
+  arrangementModeBySession: Record<string, ArrangementMode | null>;
   canvas: CanvasState;
   zoomBookmark: CanvasZoomBookmark | null;
   closeTabConfirmation: CloseTabConfirmation | null;

@@ -38,6 +38,27 @@ function capturePane(runtime: HerdIntegrationRuntime, paneId: string): string {
   ]);
 }
 
+async function appendTaskNotification(
+  transcriptPath: string,
+  toolUseId: string,
+  status: string,
+  taskId: string,
+): Promise<void> {
+  const line = JSON.stringify({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    sessionId: 'test-session',
+    content: `<task-notification>
+<task-id>${taskId}</task-id>
+<tool-use-id>${toolUseId}</tool-use-id>
+<output-file>/tmp/${taskId}.output</output-file>
+<status>${status}</status>
+<summary>Agent finished</summary>
+</task-notification>`,
+  });
+  await fs.appendFile(transcriptPath, `${line}\n`, 'utf8');
+}
+
 describe.sequential('Claude hook integration coverage', () => {
   let runtime: HerdIntegrationRuntime;
   let client: HerdTestClient;
@@ -346,6 +367,226 @@ sleep 30
     expect(processCommand).toContain('--agent-name run-git-log-oneline-10-in-the-current-di-12345678');
   });
 
+  it('streams the output file for background generic Agent payloads instead of attaching to a blank Claude UI', async () => {
+    const projection = await createIsolatedTab(client, 'hook-bg-generic-agent');
+    const rootPaneId = projection.selected_pane_id;
+    const rootWindowId = projection.active_tab_terminals[0]?.windowId;
+    expect(rootPaneId).toBeTruthy();
+    expect(rootWindowId).toBeTruthy();
+
+    const transcriptDir = await fs.mkdtemp(path.join(os.tmpdir(), 'herd-bg-generic-agent-'));
+    const transcriptPath = path.join(transcriptDir, 'parent.jsonl');
+    const outputFile = path.join(transcriptDir, 'agent-output.log');
+    const toolUseId = 'toolu_bg_generic_agent_12345678';
+    const resolvedAgentId = 'agent-bg-generic-abcdef12';
+    const fakeAgentPath = path.join(os.tmpdir(), 'herd-fake-claude-bg-generic-agent.sh');
+    await fs.writeFile(
+      fakeAgentPath,
+      `#!/bin/bash
+echo "attach path should not run"
+exit 99
+`,
+      'utf8',
+    );
+    await fs.chmod(fakeAgentPath, 0o755);
+
+    await fs.writeFile(
+      transcriptPath,
+      `${JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'toolu_other_background_agent_12345678',
+              content: [
+                {
+                  type: 'text',
+                  text: 'Async agent launched successfully.\nagentId: agent-other-abcdef12\noutput_file: /tmp/other-agent.output',
+                },
+              ],
+            },
+          ],
+        },
+        toolUseResult: {
+          agentId: 'agent-other-abcdef12',
+          outputFile: '/tmp/other-agent.output',
+        },
+      })}\n`
+        + `${JSON.stringify({
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: toolUseId,
+                content: [
+                  {
+                    type: 'text',
+                    text: `Async agent launched successfully.\nagentId: ${resolvedAgentId} (internal ID - do not mention to user.)\noutput_file: ${outputFile}`,
+                  },
+                ],
+              },
+            ],
+          },
+          toolUseResult: {
+            agentId: resolvedAgentId,
+            outputFile,
+          },
+        })}\n`,
+      'utf8',
+    );
+
+    await runConfiguredPreToolUseHook(
+      'Agent',
+      {
+        session_id: '45454545-4545-4545-4545-454545454545',
+        transcript_path: transcriptPath,
+        tool_use_id: toolUseId,
+        permission_mode: 'bypassPermissions',
+        tool_input: {
+          description: 'Background generic agent output stream',
+          prompt: 'Background generic agent output stream',
+          subagent_type: 'Explore',
+          run_in_background: true,
+        },
+      },
+      {
+        HERD_SOCK: runtime.socketPath,
+        TMUX_PANE: rootPaneId!,
+        HERD_CLAUDE_AGENT_BIN: fakeAgentPath,
+      },
+    );
+
+    const withChild = await waitFor(
+      'background generic agent hook tile',
+      () => client.getProjection(),
+      (nextProjection) =>
+        nextProjection.active_tab_terminals.length === 2
+        && nextProjection.active_tab_connections.length === 1
+        && nextProjection.active_tab_terminals.some((term) => term.title.startsWith('Explore: ')),
+      30_000,
+      150,
+    );
+
+    const childTile = withChild.active_tab_terminals.find((term) => term.id !== rootPaneId);
+    expect(childTile).toBeTruthy();
+    expect(childTile?.readOnly ?? false).toBe(false);
+    expect(childTile?.parentWindowId).toBe(rootWindowId);
+    expect(withChild.active_tab_connections[0]?.parent_window_id).toBe(rootWindowId);
+
+    await waitFor(
+      'background generic waiting output',
+      () => capturePane(runtime, childTile!.id),
+      (text) => text.includes('Waiting for agent output file...') && text.includes('Following agent output:'),
+      30_000,
+      150,
+    );
+
+    await fs.writeFile(
+      outputFile,
+      `${JSON.stringify({
+        parentUuid: null,
+        isSidechain: true,
+        agentId: resolvedAgentId,
+        type: 'user',
+        message: {
+          role: 'user',
+          content: 'Run the background test command.',
+        },
+      })}\n`
+        + `${JSON.stringify({
+          parentUuid: 'root-1',
+          isSidechain: true,
+          agentId: resolvedAgentId,
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [
+              {
+                type: 'tool_use',
+                id: 'toolu_bg_agent_bash_123',
+                name: 'Bash',
+                input: {
+                  command: 'printf "first line\\nsecond line\\n"',
+                  description: 'Emit two lines',
+                },
+              },
+            ],
+          },
+        })}\n`
+        + `${JSON.stringify({
+          parentUuid: 'tool-1',
+          isSidechain: true,
+          agentId: resolvedAgentId,
+          type: 'user',
+          message: {
+            role: 'user',
+            content: [
+              {
+                type: 'tool_result',
+                tool_use_id: 'toolu_bg_agent_bash_123',
+                content: 'first line\nsecond line',
+                is_error: false,
+              },
+            ],
+          },
+        })}\n`
+        + `${JSON.stringify({
+          parentUuid: 'result-1',
+          isSidechain: true,
+          agentId: resolvedAgentId,
+          type: 'assistant',
+          message: {
+            role: 'assistant',
+            content: [
+              {
+                type: 'text',
+                text: 'Agent finished.',
+              },
+            ],
+          },
+        })}\n`,
+      'utf8',
+    );
+
+    const paneText = await waitFor(
+      'background generic tailed output',
+      () => capturePane(runtime, childTile!.id),
+      (text) =>
+        text.includes('Prompt: Run the background test command.')
+        && text.includes('[Bash] printf "first line\\nsecond line\\n"')
+        && text.includes('first line')
+        && text.includes('second line')
+        && text.includes('Agent finished.'),
+      30_000,
+      150,
+    );
+    expect(paneText).toContain('Prompt: Run the background test command.');
+    expect(paneText).toContain('[Bash] printf "first line\\nsecond line\\n"');
+    expect(paneText).toContain('first line');
+    expect(paneText).toContain('second line');
+    expect(paneText).toContain('Agent finished.');
+    expect(paneText).not.toContain('"parentUuid"');
+
+    const processCommand = paneProcessCommand(runtime, childTile!.id);
+    expect(processCommand).toContain('stream-agent-output.py');
+    expect(processCommand).not.toContain(fakeAgentPath);
+
+    await appendTaskNotification(transcriptPath, toolUseId, 'completed', resolvedAgentId);
+
+    const withoutChild = await waitFor(
+      'background generic agent tile to close',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.active_tab_terminals.length === 1,
+      30_000,
+      150,
+    );
+    expect(withoutChild.active_tab_terminals[0]?.id).toBe(rootPaneId);
+  });
+
   it('retries generic agent attach when the child command exits immediately', async () => {
     const projection = await createIsolatedTab(client, 'hook-retry-agent');
     const rootPaneId = projection.selected_pane_id;
@@ -455,6 +696,172 @@ sleep 30
     expect(processCommand).toContain('--agent-name retry-attach-test-12345678');
   });
 
+  it('closes a generic agent tile when Claude emits a completed task notification', async () => {
+    const projection = await createIsolatedTab(client, 'hook-complete-agent');
+    const rootPaneId = projection.selected_pane_id;
+    expect(rootPaneId).toBeTruthy();
+
+    const transcriptDir = await fs.mkdtemp(path.join(os.tmpdir(), 'herd-complete-agent-'));
+    const transcriptPath = path.join(transcriptDir, 'parent.jsonl');
+    const toolUseId = 'toolu_complete_agent_12345678';
+    const resolvedAgentId = 'agent-complete-abcdef12';
+    await fs.writeFile(
+      transcriptPath,
+      `${JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: [
+                {
+                  type: 'text',
+                  text: `Async agent launched successfully.\nagentId: ${resolvedAgentId} (internal ID - do not mention to user.)`,
+                },
+              ],
+            },
+          ],
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    const fakeAgentPath = path.join(os.tmpdir(), 'herd-fake-claude-complete-agent.sh');
+    await fs.writeFile(
+      fakeAgentPath,
+      `#!/bin/bash
+sleep 300
+`,
+      'utf8',
+    );
+    await fs.chmod(fakeAgentPath, 0o755);
+
+    await runConfiguredPreToolUseHook(
+      'Agent',
+      {
+        session_id: '66666666-6666-6666-6666-666666666666',
+        transcript_path: transcriptPath,
+        tool_use_id: toolUseId,
+        permission_mode: 'bypassPermissions',
+        tool_input: {
+          description: 'Completion close test',
+          prompt: 'Completion close test',
+        },
+      },
+      {
+        HERD_SOCK: runtime.socketPath,
+        TMUX_PANE: rootPaneId!,
+        HERD_CLAUDE_AGENT_BIN: fakeAgentPath,
+      },
+    );
+
+    const withChild = await waitFor(
+      'completion watcher agent tile',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.active_tab_terminals.length === 2,
+      30_000,
+      150,
+    );
+    const childTile = withChild.active_tab_terminals.find((term) => term.id !== rootPaneId);
+    expect(childTile).toBeTruthy();
+
+    await appendTaskNotification(transcriptPath, toolUseId, 'completed', resolvedAgentId);
+
+    const withoutChild = await waitFor(
+      'completed agent tile to close',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.active_tab_terminals.length === 1,
+      30_000,
+      150,
+    );
+    expect(withoutChild.active_tab_terminals[0]?.id).toBe(rootPaneId);
+  });
+
+  it('closes a generic agent tile when Claude emits a killed task notification', async () => {
+    const projection = await createIsolatedTab(client, 'hook-killed-agent');
+    const rootPaneId = projection.selected_pane_id;
+    expect(rootPaneId).toBeTruthy();
+
+    const transcriptDir = await fs.mkdtemp(path.join(os.tmpdir(), 'herd-killed-agent-'));
+    const transcriptPath = path.join(transcriptDir, 'parent.jsonl');
+    const toolUseId = 'toolu_killed_agent_12345678';
+    const resolvedAgentId = 'agent-killed-abcdef12';
+    await fs.writeFile(
+      transcriptPath,
+      `${JSON.stringify({
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: toolUseId,
+              content: [
+                {
+                  type: 'text',
+                  text: `Async agent launched successfully.\nagentId: ${resolvedAgentId} (internal ID - do not mention to user.)`,
+                },
+              ],
+            },
+          ],
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    const fakeAgentPath = path.join(os.tmpdir(), 'herd-fake-claude-killed-agent.sh');
+    await fs.writeFile(
+      fakeAgentPath,
+      `#!/bin/bash
+sleep 300
+`,
+      'utf8',
+    );
+    await fs.chmod(fakeAgentPath, 0o755);
+
+    await runConfiguredPreToolUseHook(
+      'Agent',
+      {
+        session_id: '77777777-7777-7777-7777-777777777777',
+        transcript_path: transcriptPath,
+        tool_use_id: toolUseId,
+        permission_mode: 'bypassPermissions',
+        tool_input: {
+          description: 'Killed close test',
+          prompt: 'Killed close test',
+        },
+      },
+      {
+        HERD_SOCK: runtime.socketPath,
+        TMUX_PANE: rootPaneId!,
+        HERD_CLAUDE_AGENT_BIN: fakeAgentPath,
+      },
+    );
+
+    const withChild = await waitFor(
+      'killed watcher agent tile',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.active_tab_terminals.length === 2,
+      30_000,
+      150,
+    );
+    const childTile = withChild.active_tab_terminals.find((term) => term.id !== rootPaneId);
+    expect(childTile).toBeTruthy();
+
+    await appendTaskNotification(transcriptPath, toolUseId, 'killed', resolvedAgentId);
+
+    const withoutChild = await waitFor(
+      'killed agent tile to close',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.active_tab_terminals.length === 1,
+      30_000,
+      150,
+    );
+    expect(withoutChild.active_tab_terminals[0]?.id).toBe(rootPaneId);
+  });
+
   it('creates a read-only background tool tile and skips foreground Bash hooks', async () => {
     const projection = await createIsolatedTab(client, 'hook-bash');
     const rootPaneId = projection.selected_pane_id;
@@ -525,5 +932,56 @@ sleep 30
 
     const bgOutput = await accumulatePaneOutput(client, bgTile!.id, /Running: sleep 5 && echo done/);
     expect(bgOutput).toContain('Running: sleep 5 && echo done');
+  });
+
+  it('closes a background Bash tile when Claude emits a completed task notification', async () => {
+    const projection = await createIsolatedTab(client, 'hook-bash-complete');
+    const rootPaneId = projection.selected_pane_id;
+    expect(rootPaneId).toBeTruthy();
+
+    const transcriptDir = await fs.mkdtemp(path.join(os.tmpdir(), 'herd-bg-complete-'));
+    const transcriptPath = path.join(transcriptDir, 'parent.jsonl');
+    const toolUseId = 'toolu_bg_complete_12345678';
+    await fs.writeFile(transcriptPath, '', 'utf8');
+
+    await runConfiguredPreToolUseHook(
+      'Bash',
+      {
+        transcript_path: transcriptPath,
+        tool_use_id: toolUseId,
+        tool_input: {
+          run_in_background: true,
+          command: 'sleep 5 && echo done',
+          description: 'BG completion test',
+        },
+      },
+      {
+        HERD_SOCK: runtime.socketPath,
+        TMUX_PANE: rootPaneId!,
+      },
+    );
+
+    const withChild = await waitFor(
+      'background Bash completion tile',
+      () => client.getProjection(),
+      (nextProjection) =>
+        nextProjection.active_tab_terminals.length === 2
+        && nextProjection.active_tab_terminals.some((term) => term.title === 'BG: BG completion test'),
+      30_000,
+      150,
+    );
+    const bgTile = withChild.active_tab_terminals.find((term) => term.id !== rootPaneId);
+    expect(bgTile).toBeTruthy();
+
+    await appendTaskNotification(transcriptPath, toolUseId, 'completed', 'bg-complete-task');
+
+    const withoutChild = await waitFor(
+      'background Bash tile to close',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.active_tab_terminals.length === 1,
+      30_000,
+      150,
+    );
+    expect(withoutChild.active_tab_terminals[0]?.id).toBe(rootPaneId);
   });
 });

@@ -21,6 +21,7 @@ emit('AGENT_PROMPT', ti.get('prompt', ''))
 emit('AGENT_DESC', ti.get('description', ''))
 emit('SUBAGENT_TYPE', ti.get('subagent_type', ''))
 emit('MODEL', ti.get('model', ''))
+emit('RUN_IN_BACKGROUND', 'yes' if ti.get('run_in_background') else 'no')
 emit('TRANSCRIPT', d.get('transcript_path') or d.get('transcriptPath', ''))
 emit('SESSION_ID', d.get('session_id') or d.get('sessionId', ''))
 emit('CWD', d.get('cwd', ''))
@@ -116,6 +117,19 @@ import json, sys
 sid, command_input = sys.argv[1], sys.argv[2]
 print(json.dumps({"command": "exec_in_shell", "session_id": sid, "shell_command": command_input}))
 ' "$sid" "$command_input" 2>/dev/null)" >/dev/null 2>&1
+}
+
+start_agent_task_watcher() {
+  local sid="$1"
+  [ -z "$sid" ] && return
+  [ -z "$TRANSCRIPT" ] && return
+  [ -z "$TOOL_USE_ID" ] && return
+
+  nohup python3 "${HOOKS_DIR}/watch-agent-task.py" \
+    "$TRANSCRIPT" \
+    "$TOOL_USE_ID" \
+    "$HERD_SOCK" \
+    "$sid" >/dev/null 2>&1 &
 }
 
 resolve_claude_bin() {
@@ -275,7 +289,7 @@ print(" && ".join(parts) + "\n")
 launch_generic_agent_tile() {
   local sid title generic_label claude_bin agent_name team_name agent_color parent_session_id launch_command attach_command
   local permission_flags model_flags test_marker
-  local q_cwd q_test_marker q_resolve q_transcript q_tool_use_id q_claude_bin arg
+  local q_cwd q_test_marker q_resolve q_stream_output q_transcript q_tool_use_id q_claude_bin arg
 
   sid="$1"
   generic_label="${AGENT_DESC:-${AGENT_PROMPT:-Agent}}"
@@ -312,34 +326,50 @@ launch_generic_agent_tile() {
   fi
 
   q_cwd="$(shell_quote "$CWD")"
-  q_resolve="$(shell_quote "${HOOKS_DIR}/resolve-agent-id.py")"
+  q_resolve="$(shell_quote "${HOOKS_DIR}/resolve-agent-launch.py")"
+  q_stream_output="$(shell_quote "${HOOKS_DIR}/stream-agent-output.py")"
   q_transcript="$(shell_quote "$TRANSCRIPT")"
   q_tool_use_id="$(shell_quote "$TOOL_USE_ID")"
   q_claude_bin="$(shell_quote "$claude_bin")"
 
-  attach_command="${q_claude_bin} --agent-id \"\$AGENT_ID\""
-  for arg in \
-    --agent-name "$agent_name" \
-    --team-name "$team_name" \
-    --agent-color "$agent_color" \
-    --parent-session-id "$parent_session_id" \
-    "${permission_flags[@]}" \
-    "${model_flags[@]}"; do
-    attach_command="${attach_command} $(shell_quote "$arg")"
-  done
-
   launch_command="cd ${q_cwd} || exit 1"
-  launch_command="${launch_command}; printf '%s\\n' 'Waiting for agent session id...'"
-  launch_command="${launch_command}; AGENT_ID=\"\$(python3 ${q_resolve} ${q_transcript} ${q_tool_use_id})\" || exit 1"
-  launch_command="${launch_command}; [ -n \"\$AGENT_ID\" ] || { echo 'Failed to resolve agent id'; exit 1; }"
-  if [ -n "$test_marker" ]; then
-    q_test_marker="$(shell_quote "$test_marker")"
-    launch_command="${launch_command}; printf '%s\\n' ${q_test_marker} \"\$AGENT_ID\""
-  fi
-  launch_command="${launch_command}; ATTACH_RETRY_COUNT=0"
-  launch_command="${launch_command}; while true; do ATTACH_START=\$(date +%s); ${attach_command}; ATTACH_STATUS=\$?; ATTACH_END=\$(date +%s); ATTACH_DURATION=\$((ATTACH_END - ATTACH_START)); if [ \"\$ATTACH_DURATION\" -ge 2 ]; then exit \"\$ATTACH_STATUS\"; fi; ATTACH_RETRY_COUNT=\$((ATTACH_RETRY_COUNT + 1)); if [ \"\$ATTACH_RETRY_COUNT\" -ge 30 ]; then echo 'Failed to attach to agent session after retries.'; exit \"\$ATTACH_STATUS\"; fi; echo 'Retrying agent attach...'; sleep 1; done"
+  if [ "$RUN_IN_BACKGROUND" = "yes" ]; then
+    launch_command="${launch_command}; printf '%s\\n' 'Waiting for agent output file...'"
+    launch_command="${launch_command}; OUTPUT_FILE=\"\$(python3 ${q_resolve} ${q_transcript} ${q_tool_use_id} output_file)\" || exit 1"
+    launch_command="${launch_command}; [ -n \"\$OUTPUT_FILE\" ] || { echo 'Failed to resolve agent output file'; exit 1; }"
+    if [ -n "$test_marker" ]; then
+      q_test_marker="$(shell_quote "$test_marker")"
+      launch_command="${launch_command}; printf '%s\\n' ${q_test_marker} \"\$OUTPUT_FILE\""
+    fi
+    launch_command="${launch_command}; printf '%s %s\\n' 'Following agent output:' \"\$OUTPUT_FILE\""
+    launch_command="${launch_command}; exec python3 ${q_stream_output} \"\$OUTPUT_FILE\""
+  else
+    attach_command="${q_claude_bin} --agent-id \"\$AGENT_ID\""
+    for arg in \
+      --agent-name "$agent_name" \
+      --team-name "$team_name" \
+      --agent-color "$agent_color" \
+      --parent-session-id "$parent_session_id" \
+      "${permission_flags[@]}" \
+      "${model_flags[@]}"; do
+      attach_command="${attach_command} $(shell_quote "$arg")"
+    done
 
-  [ -n "$launch_command" ] && exec_tile_command "$sid" "$launch_command"
+    launch_command="${launch_command}; printf '%s\\n' 'Waiting for agent session id...'"
+    launch_command="${launch_command}; AGENT_ID=\"\$(python3 ${q_resolve} ${q_transcript} ${q_tool_use_id} agent_id)\" || exit 1"
+    launch_command="${launch_command}; [ -n \"\$AGENT_ID\" ] || { echo 'Failed to resolve agent id'; exit 1; }"
+    if [ -n "$test_marker" ]; then
+      q_test_marker="$(shell_quote "$test_marker")"
+      launch_command="${launch_command}; printf '%s\\n' ${q_test_marker} \"\$AGENT_ID\""
+    fi
+    launch_command="${launch_command}; ATTACH_RETRY_COUNT=0"
+    launch_command="${launch_command}; while true; do ATTACH_START=\$(date +%s); ${attach_command}; ATTACH_STATUS=\$?; ATTACH_END=\$(date +%s); ATTACH_DURATION=\$((ATTACH_END - ATTACH_START)); if [ \"\$ATTACH_DURATION\" -ge 2 ]; then exit \"\$ATTACH_STATUS\"; fi; ATTACH_RETRY_COUNT=\$((ATTACH_RETRY_COUNT + 1)); if [ \"\$ATTACH_RETRY_COUNT\" -ge 30 ]; then echo 'Failed to attach to agent session after retries.'; exit \"\$ATTACH_STATUS\"; fi; echo 'Retrying agent attach...'; sleep 1; done"
+  fi
+
+  if [ -n "$launch_command" ]; then
+    start_agent_task_watcher "$sid"
+    exec_tile_command "$sid" "$launch_command"
+  fi
 }
 
 HOOK_MODE=""

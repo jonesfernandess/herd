@@ -534,10 +534,12 @@ describe('autoArrange', () => {
 
     const next = get(appState);
     expect(next.layout.entries['@1']).toEqual({ x: 100, y: 100, width: 640, height: 400 });
-    expect(next.layout.entries['@2']).toEqual({ x: 100, y: 540, width: 640, height: 400 });
+    expect(next.layout.entries['@2']).toEqual({ x: 100, y: -700, width: 640, height: 400 });
+    expect(next.ui.arrangementModeBySession['$1']).toBe('circle');
+    expect(next.ui.arrangementCycleBySession['$1']).toBe(1);
     expect(tauriMocks.saveLayoutState).toHaveBeenCalledTimes(2);
     expect(tauriMocks.saveLayoutState).toHaveBeenNthCalledWith(1, '@1', 100, 100, 640, 400);
-    expect(tauriMocks.saveLayoutState).toHaveBeenNthCalledWith(2, '@2', 100, 540, 640, 400);
+    expect(tauriMocks.saveLayoutState).toHaveBeenNthCalledWith(2, '@2', 100, -700, 640, 400);
   });
 
   it('advances through the remaining arrangement cycle on repeated calls', async () => {
@@ -562,11 +564,11 @@ describe('autoArrange', () => {
     await autoArrange('$1');
     const fifth = get(appState).layout.entries['@2'];
 
-    expect(first).toEqual({ x: 100, y: 540, width: 640, height: 400 });
-    expect(second).toEqual({ x: 780, y: 100, width: 640, height: 400 });
-    expect(third).toEqual({ x: 780, y: 100, width: 640, height: 400 });
-    expect(fourth).toEqual({ x: 100, y: -700, width: 640, height: 400 });
-    expect(fifth).toEqual({ x: 500, y: -580, width: 640, height: 400 });
+    expect(first).toEqual({ x: 100, y: -700, width: 640, height: 400 });
+    expect(second).toEqual({ x: 500, y: -580, width: 640, height: 400 });
+    expect(third).toEqual({ x: 100, y: 540, width: 640, height: 400 });
+    expect(fourth).toEqual({ x: 780, y: 100, width: 640, height: 400 });
+    expect(fifth).toEqual({ x: 780, y: 100, width: 640, height: 400 });
   });
 
   it('adds circle and snowflake radial arrangements around the selected tile', async () => {
@@ -578,19 +580,15 @@ describe('autoArrange', () => {
     appState.set(state);
 
     await autoArrange('$1');
-    await autoArrange('$1');
-    await autoArrange('$1');
-    const spiral = get(appState).layout.entries;
-
-    await autoArrange('$1');
     const circle = get(appState).layout.entries;
 
     await autoArrange('$1');
     const snowflake = get(appState).layout.entries;
 
-    expect(spiral['@1']).toEqual({ x: 100, y: 100, width: 640, height: 400 });
-    expect(spiral['@2']).toEqual({ x: 780, y: 100, width: 640, height: 400 });
-    expect(spiral['@4']).toEqual({ x: 780, y: 540, width: 640, height: 400 });
+    await autoArrange('$1');
+    await autoArrange('$1');
+    await autoArrange('$1');
+    const spiral = get(appState).layout.entries;
 
     expect(circle['@1']).toEqual({ x: 100, y: 100, width: 640, height: 400 });
     expect(circle['@2']).toEqual({ x: 100, y: -700, width: 640, height: 400 });
@@ -601,6 +599,10 @@ describe('autoArrange', () => {
     expect(snowflake['@2']).toEqual({ x: 500, y: -580, width: 640, height: 400 });
     expect(snowflake['@4']).toEqual({ x: 900, y: 100, width: 640, height: 400 });
     expect(snowflake['@5']).toEqual({ x: 500, y: 780, width: 640, height: 400 });
+
+    expect(spiral['@1']).toEqual({ x: 100, y: 100, width: 640, height: 400 });
+    expect(spiral['@2']).toEqual({ x: 780, y: 100, width: 640, height: 400 });
+    expect(spiral['@4']).toEqual({ x: 780, y: 540, width: 640, height: 400 });
   });
 
   it('keeps all arranged windows non-overlapping across the full cycle', async () => {
@@ -622,6 +624,27 @@ describe('autoArrange', () => {
         }
       }
     }
+  });
+
+  it('reapplies the current arrangement mode when a new shell appears in the same session', async () => {
+    const state = applyTmuxSnapshotToState(freshState(), snapshotWithMainWindowCount(4));
+    for (const windowId of state.tmux.sessions['$1'].window_ids) {
+      state.layout.entries[windowId] = { x: 100, y: 100, width: 640, height: 400 };
+    }
+    state.ui.selectedPaneId = '%1';
+    appState.set(state);
+
+    await autoArrange('$1');
+    const arranged = get(appState);
+    const next = applyTmuxSnapshotToState(arranged, snapshotWithMainWindowCount(5));
+
+    expect(next.ui.arrangementModeBySession['$1']).toBe('circle');
+    expect(next.ui.arrangementCycleBySession['$1']).toBe(1);
+    expect(next.layout.entries['@1']).toEqual({ x: 100, y: 100, width: 640, height: 400 });
+    expect(next.layout.entries['@2']).toEqual({ x: 100, y: -700, width: 640, height: 400 });
+    expect(next.layout.entries['@4']).toEqual({ x: 900, y: 100, width: 640, height: 400 });
+    expect(next.layout.entries['@5']).toEqual({ x: 100, y: 900, width: 640, height: 400 });
+    expect(next.layout.entries['@6']).toEqual({ x: -700, y: 100, width: 640, height: 400 });
   });
 });
 

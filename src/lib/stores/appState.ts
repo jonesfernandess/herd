@@ -17,6 +17,7 @@ import {
   writePane,
 } from '../tauri';
 import type {
+  ArrangementMode,
   AppStateTree,
   CanvasState,
   CanvasZoomMode,
@@ -42,8 +43,7 @@ const GRID_SNAP = 20;
 const GAP = 30;
 const DEFAULT_TILE_WIDTH = 640;
 const DEFAULT_TILE_HEIGHT = 400;
-const AUTO_ARRANGE_PATTERNS = ['stack-down', 'stack-right', 'spiral', 'circle', 'snowflake'] as const;
-type AutoArrangePattern = (typeof AUTO_ARRANGE_PATTERNS)[number];
+const AUTO_ARRANGE_PATTERNS: ArrangementMode[] = ['circle', 'snowflake', 'stack-down', 'stack-right', 'spiral'];
 
 type TmuxEffect =
   | { type: 'new-session'; name?: string }
@@ -104,6 +104,7 @@ const initialUiState: UiState = {
   selectedPaneId: null,
   paneViewportHints: {},
   arrangementCycleBySession: {},
+  arrangementModeBySession: {},
   canvas: {
     panX: 0,
     panY: 0,
@@ -524,6 +525,20 @@ function reconcileArrangementCycles(
   return nextCycles;
 }
 
+function reconcileArrangementModes(
+  previousModes: Record<string, ArrangementMode | null>,
+  sessions: Record<string, TmuxSession>,
+): Record<string, ArrangementMode | null> {
+  const nextModes: Record<string, ArrangementMode | null> = {};
+  for (const sessionId of Object.keys(sessions)) {
+    const pattern = previousModes[sessionId];
+    if (pattern) {
+      nextModes[sessionId] = pattern;
+    }
+  }
+  return nextModes;
+}
+
 function snapLayoutEntriesToTmux(
   entries: Record<string, LayoutEntry>,
   windows: Record<string, AppStateTree['tmux']['windows'][string]>,
@@ -604,6 +619,16 @@ function chooseSelectedPaneId(
   return preferredPaneIdForSession({ ...previousState, tmux: nextTmux }, activeSessionId);
 }
 
+function nextArrangementPatternForSession(state: AppStateTree, sessionId: string): ArrangementMode {
+  const patternIndex = state.ui.arrangementCycleBySession[sessionId] ?? 0;
+  return AUTO_ARRANGE_PATTERNS[patternIndex % AUTO_ARRANGE_PATTERNS.length];
+}
+
+function arrangementIndex(pattern: ArrangementMode): number {
+  const index = AUTO_ARRANGE_PATTERNS.indexOf(pattern);
+  return index >= 0 ? index : 0;
+}
+
 export function applyTmuxSnapshotToState(
   previousState: AppStateTree,
   snapshot: TmuxSnapshot,
@@ -638,12 +663,16 @@ export function applyTmuxSnapshotToState(
     previousState.ui.arrangementCycleBySession,
     sessions,
   );
+  const arrangementModeBySession = reconcileArrangementModes(
+    previousState.ui.arrangementModeBySession,
+    sessions,
+  );
   const snappedLayoutEntries = snapLayoutEntriesToTmux(layoutEntries, windows, paneViewportHints);
   const closeTabConfirmation = previousState.ui.closeTabConfirmation
     ? buildCloseTabConfirmation(nextTmux, previousState.ui.closeTabConfirmation.sessionId)
     : null;
 
-  const nextState: AppStateTree = {
+  let nextState: AppStateTree = {
     tmux: nextTmux,
     layout: {
       entries: snappedLayoutEntries,
@@ -653,10 +682,18 @@ export function applyTmuxSnapshotToState(
       selectedPaneId,
       paneViewportHints,
       arrangementCycleBySession,
+      arrangementModeBySession,
       closeTabConfirmation,
       sidebarSelectedIdx: previousState.ui.sidebarSelectedIdx,
     },
   };
+  for (const sessionId of nextTmux.sessionOrder) {
+    const pattern = nextState.ui.arrangementModeBySession[sessionId];
+    const previousWindowCount = previousState.tmux.sessions[sessionId]?.window_ids.length ?? 0;
+    const nextWindowCount = nextTmux.sessions[sessionId]?.window_ids.length ?? 0;
+    if (!pattern || nextWindowCount <= previousWindowCount) continue;
+    nextState = applyArrangementPattern(nextState, sessionId, pattern).state;
+  }
   nextState.ui.sidebarSelectedIdx = clampSidebarIndex(nextState, nextState.ui.sidebarSelectedIdx);
   return nextState;
 }
@@ -1143,6 +1180,11 @@ export const activeTabId: Writable<string | null> = {
   },
   update() {},
 };
+
+export const activeArrangementMode = derived(appState, ($state) => {
+  const sessionId = $state.tmux.activeSessionId;
+  return sessionId ? $state.ui.arrangementModeBySession[sessionId] ?? null : null;
+});
 
 export const sidebarItems = derived(appState, ($state) => buildSidebarItems($state));
 
@@ -1792,7 +1834,7 @@ function arrangementOrder(windowIds: string[], anchorWindowId: string): string[]
 }
 
 function arrangedPositionForIndex(
-  pattern: AutoArrangePattern,
+  pattern: ArrangementMode,
   anchor: LayoutEntry,
   width: number,
   height: number,
@@ -1840,18 +1882,21 @@ function arrangedPositionForIndex(
   }
 }
 
-export async function autoArrange(sessionId: string | null) {
-  if (!sessionId) return;
-  const state = get(appState);
+function applyArrangementPattern(
+  state: AppStateTree,
+  sessionId: string,
+  pattern: ArrangementMode,
+): { state: AppStateTree; arrangedEntries: Record<string, LayoutEntry> } {
   const windowIds = state.tmux.sessions[sessionId]?.window_ids ?? [];
-  if (windowIds.length === 0) return;
+  if (windowIds.length === 0) {
+    return { state, arrangedEntries: {} };
+  }
+
   const selectedPaneId = state.ui.selectedPaneId;
   const selectedWindowId = selectedPaneId ? state.tmux.panes[selectedPaneId]?.window_id ?? null : null;
   const anchorWindowId = selectedWindowId && windowIds.includes(selectedWindowId)
     ? selectedWindowId
     : windowIds[0];
-  const patternIndex = state.ui.arrangementCycleBySession[sessionId] ?? 0;
-  const pattern = AUTO_ARRANGE_PATTERNS[patternIndex % AUTO_ARRANGE_PATTERNS.length];
   const orderedWindowIds = arrangementOrder(windowIds, anchorWindowId);
   const anchorEntry = state.layout.entries[anchorWindowId] ?? {
     x: 100,
@@ -1861,53 +1906,68 @@ export async function autoArrange(sessionId: string | null) {
   };
 
   const arrangedEntries: Record<string, LayoutEntry> = {};
+  const entries = { ...state.layout.entries };
+  arrangedEntries[anchorWindowId] = {
+    ...anchorEntry,
+    width: entries[anchorWindowId]?.width ?? anchorEntry.width,
+    height: entries[anchorWindowId]?.height ?? anchorEntry.height,
+  };
+  entries[anchorWindowId] = arrangedEntries[anchorWindowId];
 
-  appState.update((current) => {
-    const entries = { ...current.layout.entries };
-    arrangedEntries[anchorWindowId] = {
-      ...anchorEntry,
-      width: entries[anchorWindowId]?.width ?? anchorEntry.width,
-      height: entries[anchorWindowId]?.height ?? anchorEntry.height,
-    };
-    entries[anchorWindowId] = arrangedEntries[anchorWindowId];
-
-    const siblingCount = orderedWindowIds.length - 1;
-    orderedWindowIds.slice(1).forEach((windowId, index) => {
-      const width = entries[windowId]?.width ?? DEFAULT_TILE_WIDTH;
-      const height = entries[windowId]?.height ?? DEFAULT_TILE_HEIGHT;
-      const position = arrangedPositionForIndex(
-        pattern,
-        arrangedEntries[anchorWindowId],
-        width,
-        height,
-        index,
-        siblingCount,
-      );
-      arrangedEntries[windowId] = findOpenPosition(
-        position.x,
-        position.y,
-        width,
-        height,
-        Object.keys(arrangedEntries),
-        arrangedEntries,
-      );
-      entries[windowId] = arrangedEntries[windowId];
-    });
-    return {
-      ...current,
-      layout: { entries },
-      ui: {
-        ...current.ui,
-        arrangementCycleBySession: {
-          ...current.ui.arrangementCycleBySession,
-          [sessionId]: (patternIndex + 1) % AUTO_ARRANGE_PATTERNS.length,
-        },
-      },
-    };
+  const siblingCount = orderedWindowIds.length - 1;
+  orderedWindowIds.slice(1).forEach((windowId, index) => {
+    const width = entries[windowId]?.width ?? DEFAULT_TILE_WIDTH;
+    const height = entries[windowId]?.height ?? DEFAULT_TILE_HEIGHT;
+    const position = arrangedPositionForIndex(
+      pattern,
+      arrangedEntries[anchorWindowId],
+      width,
+      height,
+      index,
+      siblingCount,
+    );
+    arrangedEntries[windowId] = findOpenPosition(
+      position.x,
+      position.y,
+      width,
+      height,
+      Object.keys(arrangedEntries),
+      arrangedEntries,
+    );
+    entries[windowId] = arrangedEntries[windowId];
   });
 
+  const nextPatternIndex = (arrangementIndex(pattern) + 1) % AUTO_ARRANGE_PATTERNS.length;
+  return {
+    state: {
+      ...state,
+      layout: { entries },
+      ui: {
+        ...state.ui,
+        arrangementCycleBySession: {
+          ...state.ui.arrangementCycleBySession,
+          [sessionId]: nextPatternIndex,
+        },
+        arrangementModeBySession: {
+          ...state.ui.arrangementModeBySession,
+          [sessionId]: pattern,
+        },
+      },
+    },
+    arrangedEntries,
+  };
+}
+
+export async function autoArrange(sessionId: string | null) {
+  if (!sessionId) return;
+  const state = get(appState);
+  const pattern = nextArrangementPatternForSession(state, sessionId);
+  const next = applyArrangementPattern(state, sessionId, pattern);
+  if (Object.keys(next.arrangedEntries).length === 0) return;
+  appState.set(next.state);
+
   await Promise.all(
-    Object.entries(arrangedEntries).map(([windowId, entry]) =>
+    Object.entries(next.arrangedEntries).map(([windowId, entry]) =>
       saveLayoutState(windowId, entry.x, entry.y, entry.width, entry.height),
     ),
   );

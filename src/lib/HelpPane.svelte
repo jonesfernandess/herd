@@ -48,7 +48,7 @@
         { key: 'Shift+=', desc: 'zoom the canvas in' },
         { key: 'f', desc: 'fit all shells in view' },
         { key: '0', desc: 'reset canvas zoom and pan' },
-        { key: 'a', desc: 'cycle anchored shell arrangements, including circle and snowflake, then fit view' },
+        { key: 'a', desc: 'cycle anchored shell arrangements starting with circle and snowflake, then fit view' },
       ],
     },
     {

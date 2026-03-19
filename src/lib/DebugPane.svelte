@@ -3,6 +3,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { debugPaneOpen } from './stores/debugPane';
   import { mode } from './stores/mode';
+  import { activeArrangementMode } from './stores/appState';
   import { selectedTerminalId, terminals } from './stores/terminals';
   import { activeTabTerminals, activeTabId } from './stores/tabs';
   import { canvasState } from './stores/canvas';
@@ -24,6 +25,7 @@
     panX: Math.round($canvasState.panX),
     panY: Math.round($canvasState.panY),
     tabId: $activeTabId,
+    arrangement: $activeArrangementMode ?? 'manual',
   });
 
   function log(msg: string) {
@@ -114,6 +116,7 @@
           [{debugInfo.mode}]
           sel={debugInfo.selectedId}
           tiles={debugInfo.tabTerminals}/{debugInfo.totalTerminals}
+          arr={debugInfo.arrangement}
           zoom={debugInfo.zoom}%
           pan={debugInfo.panX},{debugInfo.panY}
         </span>
