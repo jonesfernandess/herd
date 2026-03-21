@@ -36,7 +36,7 @@
       rows: [
         { key: 'Ctrl+h/j/k/l', desc: 'move the selected shell' },
         { key: 'Ctrl+Shift+h/j/k/l', desc: 'move the selected shell faster' },
-        { key: 'H / J / K / L', desc: 'pan the canvas' },
+        { key: 'H / J / K / L', desc: 'pan the canvas when the sidebar is not open' },
       ],
     },
     {
@@ -69,7 +69,8 @@
     {
       title: 'SIDEBAR',
       rows: [
-        { key: 'j / k', desc: 'move the tree selection' },
+        { key: 'Shift+j / Shift+k', desc: 'focus the next / previous sidebar section' },
+        { key: 'j / k', desc: 'move within the focused sidebar section' },
         { key: 'i', desc: 'enter input mode for the selected shell' },
         { key: 'r', desc: 'prefill a rename command for the selected item' },
         { key: 'z', desc: 'zoom to the selected shell' },

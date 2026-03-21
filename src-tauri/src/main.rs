@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    herd_lib::run();
+    herd_lib::run_entry(std::env::args().collect());
 }

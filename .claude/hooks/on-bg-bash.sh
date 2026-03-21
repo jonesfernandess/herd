@@ -63,7 +63,7 @@ spawn_tile() {
 import json, sys
 x, y, parent = sys.argv[1], sys.argv[2], sys.argv[3]
 print(json.dumps({
-    "command": "spawn_shell",
+    "command": "shell_spawn",
     "x": float(x),
     "y": float(y),
     "width": 640,
@@ -76,7 +76,7 @@ print(json.dumps({
 import json, sys
 x, y = sys.argv[1], sys.argv[2]
 print(json.dumps({
-    "command": "spawn_shell",
+    "command": "shell_spawn",
     "x": float(x),
     "y": float(y),
     "width": 640,
@@ -92,7 +92,7 @@ set_tile_title() {
   socket_request "$(python3 -c '
 import json, sys
 sid, title = sys.argv[1], sys.argv[2]
-print(json.dumps({"command": "set_title", "session_id": sid, "title": title}))
+print(json.dumps({"command": "shell_title_set", "session_id": sid, "title": title}))
 ' "$sid" "$title" 2>/dev/null)" >/dev/null 2>&1
 }
 
@@ -101,7 +101,7 @@ set_tile_read_only() {
   socket_request "$(python3 -c '
 import json, sys
 sid = sys.argv[1]
-print(json.dumps({"command": "set_read_only", "session_id": sid, "read_only": True}))
+print(json.dumps({"command": "shell_read_only_set", "session_id": sid, "read_only": True}))
 ' "$sid" 2>/dev/null)" >/dev/null 2>&1
 }
 
@@ -110,7 +110,7 @@ set_tile_role() {
   socket_request "$(python3 -c '
 import json, sys
 sid = sys.argv[1]
-print(json.dumps({"command": "set_tile_role", "session_id": sid, "role": "output"}))
+print(json.dumps({"command": "shell_role_set", "session_id": sid, "role": "output"}))
 ' "$sid" 2>/dev/null)" >/dev/null 2>&1
 }
 
@@ -120,7 +120,7 @@ send_tile_input() {
   socket_request "$(python3 -c '
 import json, sys
 sid, command_input = sys.argv[1], sys.argv[2]
-print(json.dumps({"command": "send_input", "session_id": sid, "input": command_input}))
+print(json.dumps({"command": "shell_input_send", "session_id": sid, "input": command_input}))
 ' "$sid" "$command_input" 2>/dev/null)" >/dev/null 2>&1
 }
 

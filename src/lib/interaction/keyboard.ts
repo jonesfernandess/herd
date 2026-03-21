@@ -7,6 +7,7 @@ import {
   appState,
   autoArrange,
   beginSidebarRename,
+  closePaneConfirmation,
   closeSidebar,
   closeTabConfirmation,
   commandBarOpen,
@@ -16,6 +17,7 @@ import {
   fitCanvasToActiveTab,
   helpOpen,
   mode,
+  moveSidebarSection,
   moveSelectedTerminalBy,
   moveSidebarSelection,
   nextTab,
@@ -87,8 +89,23 @@ export async function handleGlobalKeyInput(input: TestDriverKey, context?: Keybo
   };
   const state = get(appState);
   const currentMode = get(mode);
+  const pendingClosePane = get(closePaneConfirmation);
   const pendingCloseTab = get(closeTabConfirmation);
   const openContextMenu = get(contextMenuState);
+
+  if (pendingClosePane) {
+    if (input.key === 'Escape' || input.key === 'n' || input.key === 'N') {
+      handled();
+      await dispatchIntent({ type: 'cancel-close-pane' });
+      return true;
+    }
+    if (input.key === 'Enter' || input.key === 'y' || input.key === 'Y' || input.key === 'X') {
+      handled();
+      await dispatchIntent({ type: 'confirm-close-pane' });
+      return true;
+    }
+    return false;
+  }
 
   if (pendingCloseTab) {
     if (input.key === 'Escape' || input.key === 'n' || input.key === 'N') {
@@ -147,6 +164,12 @@ export async function handleGlobalKeyInput(input: TestDriverKey, context?: Keybo
   }
 
   const lowerKey = input.key.toLowerCase();
+
+  if (get(sidebarOpen) && !input.ctrl_key && !input.meta_key && !input.alt_key && input.shift_key && ['j', 'k'].includes(lowerKey)) {
+    handled();
+    moveSidebarSection(lowerKey === 'j' ? 1 : -1);
+    return true;
+  }
 
   if (input.ctrl_key && !input.meta_key && !input.alt_key && ['h', 'j', 'k', 'l'].includes(lowerKey)) {
     const distance = WINDOW_MOVE_STEP * (input.shift_key ? 2 : 1);

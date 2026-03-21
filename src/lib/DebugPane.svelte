@@ -1,21 +1,35 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
-  import { debugPaneOpen } from './stores/debugPane';
+  import {
+    activeArrangementMode,
+    chatterEntries,
+    debugPaneHeight,
+    debugPaneOpen,
+    debugTab,
+    dispatchIntent,
+  } from './stores/appState';
   import { mode } from './stores/mode';
-  import { activeArrangementMode } from './stores/appState';
   import { selectedTerminalId, terminals } from './stores/terminals';
   import { activeTabTerminals, activeTabId } from './stores/tabs';
   import { canvasState } from './stores/canvas';
 
+  const MIN_DEBUG_HEIGHT = 120;
+  const DEBUG_HEIGHT_STORAGE_KEY = 'herd-debug-pane-height';
+
   let logLines = $state<string[]>([]);
   let pollInterval: ReturnType<typeof setInterval>;
   let logRef = $state<HTMLDivElement>();
+  let chatterRef = $state<HTMLDivElement>();
   let lastSocketSize = 0;
   let lastCcSize = 0;
-  let autoFollow = true;
+  let isResizing = false;
+  let resizeStartY = 0;
+  let resizeStartHeight = 200;
+  let effectiveDebugHeight = $derived(
+    Number.isFinite($debugPaneHeight) && $debugPaneHeight > 0 ? $debugPaneHeight : 200,
+  );
 
-  // Reactive debug info
   let debugInfo = $derived({
     mode: $mode,
     selectedId: $selectedTerminalId?.slice(0, 8) || 'none',
@@ -28,43 +42,37 @@
     arrangement: $activeArrangementMode ?? 'manual',
   });
 
-  function log(msg: string) {
-    const ts = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    logLines = [...logLines.slice(-200), `[${ts}] ${msg}`];
-    if (autoFollow) {
-      requestAnimationFrame(() => {
-        if (logRef) logRef.scrollTop = logRef.scrollHeight;
-      });
-    }
+  function scrollToBottom(container: HTMLDivElement | undefined) {
+    requestAnimationFrame(() => {
+      if (container) container.scrollTop = container.scrollHeight;
+    });
   }
 
-  function handleLogScroll() {
-    if (!logRef) return;
-    // If user scrolled away from bottom, stop following
-    const atBottom = logRef.scrollHeight - logRef.scrollTop - logRef.clientHeight < 30;
-    autoFollow = atBottom;
+  function appendLogLine(prefix: string, line: string) {
+    logLines = [...logLines.slice(-400), `${prefix} ${line}`];
+    if ($debugTab === 'logs') {
+      scrollToBottom(logRef);
+    }
   }
 
   async function pollLogs() {
     try {
-      // Tail socket log
       const sockResp = await invoke<string>('read_log_tail', { logName: 'socket', offset: lastSocketSize });
       if (sockResp && sockResp.length > 0) {
         lastSocketSize += sockResp.length;
         for (const line of sockResp.split('\n').filter(Boolean)) {
-          log(`SOCK ${line}`);
+          appendLogLine('SOCK', line);
         }
       }
     } catch {}
 
     try {
-      // Tail CC log
       const ccResp = await invoke<string>('read_log_tail', { logName: 'cc', offset: lastCcSize });
       if (ccResp && ccResp.length > 0) {
         lastCcSize += ccResp.length;
         for (const line of ccResp.split('\n').filter(Boolean)) {
-          if (!line.includes('%output')) { // Skip noisy %output lines
-            log(`CC ${line}`);
+          if (!line.includes('%output')) {
+            appendLogLine('CC', line);
           }
         }
       }
@@ -72,32 +80,65 @@
   }
 
   async function redrawAll() {
-    log('Redrawing all panes...');
-    try {
-      await invoke('redraw_all_panes');
-      log('Redraw complete');
-    } catch (e) {
-      log(`Redraw failed: ${e}`);
-    }
+    await invoke('redraw_all_panes').catch(() => undefined);
   }
 
   async function restartTmux() {
-    log('Restarting tmux...');
-    try {
-      await invoke('tmux_restart');
-      log('tmux restarted');
-    } catch (e) {
-      log(`tmux restart failed: ${e}`);
-    }
+    await invoke('tmux_restart').catch(() => undefined);
   }
 
   function reloadWebview() {
-    log('Reloading webview...');
     window.location.reload();
   }
 
+  function clampDebugHeight(nextHeight: number) {
+    return Math.max(MIN_DEBUG_HEIGHT, Math.min(window.innerHeight - 80, nextHeight));
+  }
+
+  function persistDebugHeight(height: number) {
+    localStorage.setItem(DEBUG_HEIGHT_STORAGE_KEY, String(Math.round(height)));
+  }
+
+  function handleResizeMouseDown(e: MouseEvent) {
+    if (e.button !== 0) return;
+    isResizing = true;
+    resizeStartY = e.clientY;
+    resizeStartHeight = $debugPaneHeight;
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function handleWindowMouseMove(e: MouseEvent) {
+    if (!isResizing) return;
+    const dy = e.clientY - resizeStartY;
+    debugPaneHeight.set(clampDebugHeight(resizeStartHeight - dy));
+  }
+
+  function handleWindowMouseUp() {
+    if (!isResizing) return;
+    isResizing = false;
+    persistDebugHeight($debugPaneHeight);
+  }
+
+  $effect(() => {
+    if ($debugTab === 'logs') {
+      logLines.length;
+      scrollToBottom(logRef);
+    }
+  });
+
+  $effect(() => {
+    if ($debugTab === 'chatter') {
+      $chatterEntries.length;
+      scrollToBottom(chatterRef);
+    }
+  });
+
   onMount(() => {
-    log('Debug pane opened');
+    const storedHeight = Number(localStorage.getItem(DEBUG_HEIGHT_STORAGE_KEY) || '');
+    if (Number.isFinite(storedHeight) && storedHeight > 0) {
+      debugPaneHeight.set(clampDebugHeight(storedHeight));
+    }
     pollInterval = setInterval(pollLogs, 2000);
     pollLogs();
   });
@@ -107,19 +148,30 @@
   });
 </script>
 
+<svelte:window onmousemove={handleWindowMouseMove} onmouseup={handleWindowMouseUp} />
+
 {#if $debugPaneOpen}
-  <div class="debug-pane">
+  <div class="debug-pane" style={`height: ${effectiveDebugHeight}px;`}>
     <div class="debug-header">
       <div class="debug-header-left">
         <span class="debug-title">DEBUG</span>
-        <span class="debug-info">
-          [{debugInfo.mode}]
-          sel={debugInfo.selectedId}
-          tiles={debugInfo.tabTerminals}/{debugInfo.totalTerminals}
-          arr={debugInfo.arrangement}
-          zoom={debugInfo.zoom}%
-          pan={debugInfo.panX},{debugInfo.panY}
-        </span>
+        <div class="debug-tabs">
+          <button class:active={$debugTab === 'info'} onclick={() => dispatchIntent({ type: 'select-debug-tab', tab: 'info' })}>
+            Info
+          </button>
+          <button class:active={$debugTab === 'logs'} onclick={() => dispatchIntent({ type: 'select-debug-tab', tab: 'logs' })}>
+            Logs
+          </button>
+          <button class:active={$debugTab === 'chatter'} onclick={() => dispatchIntent({ type: 'select-debug-tab', tab: 'chatter' })}>
+            Chatter
+          </button>
+        </div>
+      </div>
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div class="debug-resize-grip" onmousedown={handleResizeMouseDown}>
+        <span></span>
+        <span></span>
+        <span></span>
       </div>
       <div class="debug-header-right">
         <button class="debug-btn" onclick={redrawAll}>REDRAW ALL</button>
@@ -128,12 +180,35 @@
         <button class="debug-close" onclick={() => debugPaneOpen.set(false)}>×</button>
       </div>
     </div>
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <div class="debug-log" bind:this={logRef} onscroll={handleLogScroll}>
-      {#each logLines as line}
-        <div class="log-line" class:sock={line.includes('SOCK')} class:cc={line.includes('CC')}>{line}</div>
-      {/each}
-    </div>
+
+    {#if $debugTab === 'info'}
+      <div class="debug-log info-log">
+        <div class="log-line info-line">
+          [{debugInfo.mode}]
+          sel={debugInfo.selectedId}
+          tiles={debugInfo.tabTerminals}/{debugInfo.totalTerminals}
+          arr={debugInfo.arrangement}
+          zoom={debugInfo.zoom}%
+          pan={debugInfo.panX},{debugInfo.panY}
+        </div>
+      </div>
+    {:else if $debugTab === 'chatter'}
+      <div class="debug-log chatter-log" bind:this={chatterRef}>
+        {#if $chatterEntries.length === 0}
+          <div class="log-line muted">No chatter yet</div>
+        {:else}
+          {#each $chatterEntries as entry, index (`${entry.timestamp_ms}:${index}`)}
+            <div class="log-line chatter">{entry.display_text}</div>
+          {/each}
+        {/if}
+      </div>
+    {:else}
+      <div class="debug-log" bind:this={logRef}>
+        {#each logLines as line}
+          <div class="log-line" class:sock={line.startsWith('SOCK')} class:cc={line.startsWith('CC')}>{line}</div>
+        {/each}
+      </div>
+    {/if}
   </div>
 {/if}
 
@@ -152,6 +227,7 @@
   }
 
   .debug-header {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -161,7 +237,8 @@
     flex-shrink: 0;
   }
 
-  .debug-header-left, .debug-header-right {
+  .debug-header-left,
+  .debug-header-right {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -174,10 +251,25 @@
     font-weight: normal;
   }
 
-  .debug-info {
-    font-size: 9px;
+  .debug-tabs {
+    display: flex;
+    gap: 4px;
+  }
+
+  .debug-tabs button {
+    background: none;
+    border: 1px solid var(--component-border);
     color: var(--silk-dim);
     font-family: var(--font-mono);
+    font-size: 9px;
+    padding: 1px 6px;
+    cursor: pointer;
+  }
+
+  .debug-tabs button.active {
+    border-color: var(--copper);
+    color: var(--copper);
+    background: rgba(242, 176, 90, 0.08);
   }
 
   .debug-btn {
@@ -188,8 +280,6 @@
     font-size: 9px;
     padding: 1px 6px;
     cursor: pointer;
-    letter-spacing: 0.5px;
-    transition: all 0.1s;
   }
 
   .debug-btn:hover {
@@ -218,6 +308,34 @@
     color: var(--phosphor-red);
   }
 
+  .debug-resize-grip {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 18px;
+    padding: 0 6px;
+    align-items: center;
+    justify-content: center;
+    color: var(--silk-dim);
+    cursor: ns-resize;
+    user-select: none;
+  }
+
+  .debug-resize-grip:hover {
+    color: var(--phosphor-amber);
+  }
+
+  .debug-resize-grip span {
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+
   .debug-log {
     flex: 1;
     overflow-y: auto;
@@ -227,10 +345,18 @@
     line-height: 1.5;
   }
 
+  .info-log {
+    background: rgba(242, 176, 90, 0.02);
+  }
+
   .log-line {
     color: var(--silk-dim);
     white-space: pre-wrap;
-    word-break: break-all;
+    word-break: break-word;
+  }
+
+  .log-line.info-line {
+    color: var(--silk-dim);
   }
 
   .log-line.sock {
@@ -238,6 +364,14 @@
   }
 
   .log-line.cc {
+    color: var(--copper-dim);
+  }
+
+  .log-line.chatter {
+    color: var(--silk-white);
+  }
+
+  .log-line.muted {
     color: var(--copper-dim);
   }
 </style>

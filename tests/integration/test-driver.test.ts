@@ -7,6 +7,27 @@ import { startIntegrationRuntime, type HerdIntegrationRuntime } from './runtime'
 const VIEWPORT_WIDTH = 1400;
 const VIEWPORT_HEIGHT = 846;
 
+async function spawnShellInActiveTab(client: HerdTestClient): Promise<string> {
+  const before = await client.getProjection();
+  const knownPaneIds = new Set(before.active_tab_terminals.map((terminal) => terminal.id));
+  await client.sendCommand({
+    command: 'shell_create',
+    parent_session_id: before.active_tab_id,
+  });
+  const projection = await waitFor(
+    'shell create in active tab',
+    () => client.getProjection(),
+    (nextProjection) => nextProjection.active_tab_terminals.some((terminal) => !knownPaneIds.has(terminal.id)),
+    30_000,
+    150,
+  );
+  const created = projection.active_tab_terminals.find((terminal) => !knownPaneIds.has(terminal.id));
+  if (!created) {
+    throw new Error('failed to locate spawned shell pane');
+  }
+  return created.id;
+}
+
 describe.sequential('in-app test driver', () => {
   let runtime: HerdIntegrationRuntime;
   let client: HerdTestClient;
@@ -42,6 +63,98 @@ describe.sequential('in-app test driver', () => {
     expect(projection.context_menu).toBeNull();
   });
 
+  it('renders canvas tiles for the active tab and opens the debug pane', async () => {
+    const projection = await client.getProjection();
+    const canvas = await client.testDomQuery<{
+      hasCanvas: boolean;
+      tileCount: number;
+      workCount: number;
+    }>(
+      `return {
+        hasCanvas: document.querySelector(".canvas-viewport") !== null,
+        tileCount: document.querySelectorAll(".pcb-component").length,
+        workCount: document.querySelectorAll(".work-card").length
+      };`,
+    );
+
+    expect(canvas.hasCanvas).toBe(true);
+    expect(canvas.tileCount).toBe(projection.active_tab_terminals.length);
+    expect(canvas.workCount).toBe(projection.active_tab_work_cards.length);
+
+    await client.pressKeys([{ key: 'd' }], VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+
+    const debug = await waitFor(
+      'debug pane opens',
+      () =>
+        client.testDomQuery<{
+          open: boolean;
+          tabs: string[];
+        }>(
+          `return {
+            open: document.querySelector(".debug-pane") !== null,
+            tabs: Array.from(document.querySelectorAll(".debug-tabs button")).map((el) => el.textContent ?? "")
+          };`,
+        ),
+      (result) => result.open,
+      10_000,
+      100,
+    );
+
+    expect(debug.tabs).toEqual(['Info', 'Logs', 'Chatter']);
+  });
+
+  it('surfaces agent log entries in the per-pane activity projection', async () => {
+    const initial = await client.getProjection();
+    const paneId = initial.selected_pane_id ?? initial.active_tab_terminals[0]?.id;
+    expect(paneId).toBeTruthy();
+
+    await client.agentRegister('agent-log-test', paneId!, 'Activity Agent');
+
+    const agentProjection = await waitFor(
+      'registered agent projection',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.agents.some((entry) => entry.agent_id === 'agent-log-test'),
+      30_000,
+      150,
+    );
+    const agent = agentProjection.agents.find((entry) => entry.agent_id === 'agent-log-test');
+    expect(agent).toBeTruthy();
+    await client.agentPingAck('agent-log-test');
+
+    await client.sendCommand({
+      command: 'agent_log_append',
+      agent_id: 'agent-log-test',
+      kind: 'incoming_hook',
+      text: `MCP hook [system] Port connected: ${paneId}:left <-> work:work-s1-001:left`,
+    });
+    await client.sendCommand({
+      command: 'agent_log_append',
+      agent_id: 'agent-log-test',
+      kind: 'outgoing_call',
+      text: 'MCP call message_direct {"to_agent_id":"agent-2","message":"hello"}',
+    });
+
+    const projection = await waitFor(
+      'agent log activity projection',
+      () => client.getProjection(),
+      (nextProjection) =>
+        nextProjection.agent_logs.some(
+          (entry) => entry.agent_id === 'agent-log-test' && entry.kind === 'incoming_hook',
+        )
+        && (nextProjection.agent_activity_by_pane[paneId!] ?? []).some(
+          (entry) => entry.kind === 'incoming_hook',
+        )
+        && (nextProjection.agent_activity_by_pane[paneId!] ?? []).some(
+          (entry) => entry.kind === 'outgoing_call',
+        ),
+      30_000,
+      150,
+    );
+
+    expect(projection.agent_activity_by_pane[paneId!]?.map((entry) => entry.kind)).toContain('incoming_hook');
+    expect(projection.agent_activity_by_pane[paneId!]?.map((entry) => entry.kind)).toContain('outgoing_call');
+  });
+
   it('opens and dismisses typed context menus for the canvas and the selected tile', async () => {
     let projection = await client.getProjection();
     const selectedPaneId = projection.selected_pane_id;
@@ -50,7 +163,12 @@ describe.sequential('in-app test driver', () => {
     await client.canvasContextMenu(240, 180);
     projection = await client.getProjection();
     expect(projection.context_menu?.target).toBe('canvas');
-    expect(projection.context_menu?.items.map((item) => item.label)).toEqual(['New Shell']);
+    expect(projection.context_menu?.items.map((item) => item.label)).toEqual([
+      'New Shell',
+      'New Agent',
+      'New Browser',
+      'New Work',
+    ]);
 
     await client.contextMenuDismiss();
     projection = await client.getProjection();
@@ -100,7 +218,7 @@ describe.sequential('in-app test driver', () => {
     expect(projection.context_menu).toBeNull();
   });
 
-  it('shows Claude commands only for Claude tiles and dispatches execute vs insert correctly', async () => {
+  it('shows Claude commands only for Agent tiles and dispatches execute vs insert correctly', async () => {
     let projection = await createIsolatedTab(client, 'claude-menu');
     const paneId = projection.selected_pane_id;
     expect(paneId).toBeTruthy();
@@ -114,7 +232,7 @@ describe.sequential('in-app test driver', () => {
 
     await client.tileContextMenu(paneId!, 420, 240);
     projection = await waitFor(
-      'Claude context menu commands',
+      'Agent tile Claude commands',
       () => client.getProjection(),
       (nextProjection) =>
         nextProjection.context_menu?.pane_id === paneId
@@ -134,7 +252,7 @@ describe.sequential('in-app test driver', () => {
 
     await client.contextMenuSelect('claude-command:model');
     let output = await waitFor(
-      'insert-only Claude command echo',
+      'insert-only Agent-tile Claude command echo',
       () => client.readOutput(paneId!),
       (result) => result.output.includes('/model '),
       20_000,
@@ -145,7 +263,7 @@ describe.sequential('in-app test driver', () => {
 
     await client.tileContextMenu(paneId!, 420, 240);
     await waitFor(
-      'Claude context menu commands reopen',
+      'Agent tile Claude commands reopen',
       () => client.getProjection(),
       (nextProjection) =>
         nextProjection.context_menu?.pane_id === paneId
@@ -161,7 +279,7 @@ describe.sequential('in-app test driver', () => {
 
     await client.tileContextMenu(paneId!, 420, 240);
     await waitFor(
-      'Claude context menu commands after reset',
+      'Agent tile Claude commands after reset',
       () => client.getProjection(),
       (nextProjection) =>
         nextProjection.context_menu?.pane_id === paneId
@@ -173,7 +291,7 @@ describe.sequential('in-app test driver', () => {
 
     await client.contextMenuSelect('claude-command:clear');
     output = await waitFor(
-      'execute Claude command echo',
+      'execute Agent-tile Claude command echo',
       () => client.readOutput(paneId!),
       (result) => result.output.includes('/clear$'),
       20_000,
@@ -263,7 +381,406 @@ describe.sequential('in-app test driver', () => {
     expect(projection.active_tab_id).toBe(createdSessionId);
   });
 
-  it('covers shell spawn, tile selection/close, sidebar rename, and canvas actions through the typed driver', async () => {
+  it('lets focused dialog inputs bypass global shortcuts and temporarily switch the app into input mode', async () => {
+    let projection = await client.getProjection();
+    expect(projection.mode).toBe('command');
+
+    await client.testDomQuery(`document.querySelector('.tool-btn.work')?.click(); return true;`);
+    await waitFor(
+      'work dialog input to appear',
+      () => client.testDomQuery<boolean>(`return Boolean(document.querySelector('.work-input'));`),
+      (visible) => visible === true,
+      30_000,
+      150,
+    );
+
+    const focused = await client.testDomQuery<boolean>(
+      `const input = document.querySelector('.work-input'); input?.focus(); return document.activeElement === input;`,
+    );
+    expect(focused).toBe(true);
+
+    projection = await waitFor(
+      'dialog input mode override',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.mode === 'input',
+      30_000,
+      150,
+    );
+    expect(projection.mode).toBe('input');
+
+    const bypass = await client.testDomQuery<{ defaultPrevented: boolean; sidebarOpen: boolean }>(`
+      const input = document.querySelector('.work-input');
+      const event = new KeyboardEvent('keydown', { key: 'b', bubbles: true, cancelable: true });
+      input?.dispatchEvent(event);
+      return {
+        defaultPrevented: event.defaultPrevented,
+        sidebarOpen: Boolean(document.querySelector('.sidebar')),
+      };
+    `);
+    expect(bypass.defaultPrevented).toBe(false);
+    expect(bypass.sidebarOpen).toBe(false);
+
+    await client.testDomQuery(`
+      const input = document.querySelector('.work-input');
+      input?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+      return true;
+    `);
+    await waitFor(
+      'work dialog close',
+      () => client.testDomQuery<boolean>(`return Boolean(document.querySelector('.work-input'));`),
+      (visible) => visible === false,
+      30_000,
+      150,
+    );
+    projection = await waitFor(
+      'command mode after closing work dialog',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.mode === 'command',
+      30_000,
+      150,
+    );
+    expect(projection.mode).toBe('command');
+  });
+
+  it('renders work cards on the canvas, keeps the sidebar compact, and scopes tmux items to the active tab', async () => {
+    let projection = await createIsolatedTab(client, 'canvas-work-a');
+    const firstSessionId = projection.active_tab_id!;
+
+    const firstWork = await client.toolbarSpawnWork('Canvas Work A');
+    const secondWork = await client.toolbarSpawnWork('Canvas Work B');
+    projection = await waitFor(
+      'canvas work cards in first tab',
+      () => client.getProjection(),
+      (nextProjection) =>
+        nextProjection.active_tab_id === firstSessionId
+        && nextProjection.work_items.length === 2
+        && nextProjection.active_tab_work_cards.length === 2,
+      30_000,
+      150,
+    );
+
+    const secondTab = await createIsolatedTab(client, 'canvas-work-b');
+    const secondSessionId = secondTab.active_tab_id!;
+    const hiddenWork = await client.toolbarSpawnWork('Canvas Work Hidden');
+    projection = await waitFor(
+      'second tab work card',
+      () => client.getProjection(),
+      (nextProjection) =>
+        nextProjection.active_tab_id === secondSessionId
+        && nextProjection.work_items.some((item) => item.work_id === hiddenWork.work_id),
+      30_000,
+      150,
+    );
+
+    await client.toolbarSelectTab(firstSessionId);
+    await client.sidebarOpen();
+    projection = await waitFor(
+      'return to first tab work view',
+      () => client.getProjection(),
+      (nextProjection) =>
+        nextProjection.active_tab_id === firstSessionId
+        && nextProjection.work_items.every((item) => item.session_id === firstSessionId)
+        && nextProjection.active_tab_work_cards.length === 2
+        && nextProjection.sidebar.items.every((item) => item.sessionId === firstSessionId),
+      30_000,
+      150,
+    );
+
+    expect([...projection.active_tab_work_cards.map((card) => card.workId)].sort()).toEqual([
+      firstWork.work_id,
+      secondWork.work_id,
+    ].sort());
+
+    const canvasSnapshot = await client.testDomQuery<{
+      workTitles: string[];
+      compactWorkCount: number;
+      detailPanels: number;
+    }>(`return {
+      workTitles: Array.from(document.querySelectorAll('.work-card .work-card-title')).map((node) => node.textContent?.trim() ?? ''),
+      compactWorkCount: document.querySelectorAll('.work-list .work-item').length,
+      detailPanels: document.querySelectorAll('.sidebar .work-detail').length,
+    };`);
+
+    expect([...canvasSnapshot.workTitles].sort()).toEqual(['Canvas Work A', 'Canvas Work B'].sort());
+    expect(canvasSnapshot.compactWorkCount).toBe(2);
+    expect(canvasSnapshot.detailPanels).toBe(0);
+  });
+
+  it('gives work cards a draggable titlebar and lets the canvas delete them', async () => {
+    let projection = await createIsolatedTab(client, 'work-card-tile');
+    const work = await client.toolbarSpawnWork('Drag And Delete');
+
+    projection = await waitFor(
+      'work card to appear',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.active_tab_work_cards.some((card) => card.workId === work.work_id),
+      30_000,
+      150,
+    );
+
+    const originalCard = projection.active_tab_work_cards.find((card) => card.workId === work.work_id)!;
+
+    const dragReady = await client.testDomQuery<boolean>(`
+      const header = document.querySelector('[data-work-id="${work.work_id}"] .work-card-titlebar');
+      return header instanceof HTMLElement;
+    `);
+    expect(dragReady).toBe(true);
+
+    await client.testDomQuery(`
+      const header = document.querySelector('[data-work-id="${work.work_id}"] .work-card-titlebar');
+      if (!(header instanceof HTMLElement)) {
+        throw new Error('missing work-card titlebar');
+      }
+      const rect = header.getBoundingClientRect();
+      header.dispatchEvent(new MouseEvent('mousedown', {
+        button: 0,
+        bubbles: true,
+        cancelable: true,
+        clientX: rect.left + 20,
+        clientY: rect.top + 10,
+      }));
+      window.dispatchEvent(new MouseEvent('mousemove', {
+        bubbles: true,
+        cancelable: true,
+        clientX: rect.left + 140,
+        clientY: rect.top + 90,
+      }));
+      window.dispatchEvent(new MouseEvent('mouseup', {
+        bubbles: true,
+        cancelable: true,
+        clientX: rect.left + 140,
+        clientY: rect.top + 90,
+      }));
+      return true;
+    `);
+
+    projection = await waitFor(
+      'dragged work card position',
+      () => client.getProjection(),
+      (nextProjection) => {
+        const nextCard = nextProjection.active_tab_work_cards.find((card) => card.workId === work.work_id);
+        return Boolean(nextCard) && (nextCard!.x !== originalCard.x || nextCard!.y !== originalCard.y);
+      },
+      30_000,
+      150,
+    );
+
+    const movedCard = projection.active_tab_work_cards.find((card) => card.workId === work.work_id)!;
+    expect(movedCard.x).not.toBe(originalCard.x);
+    expect(movedCard.y).not.toBe(originalCard.y);
+
+    await client.testDomQuery(`
+      const button = document.querySelector('[data-work-id="${work.work_id}"] .work-card-close');
+      if (!(button instanceof HTMLButtonElement)) {
+        throw new Error('missing work-card delete button');
+      }
+      button.click();
+      return true;
+    `);
+
+    projection = await waitFor(
+      'work card deletion',
+      () => client.getProjection(),
+      (nextProjection) =>
+        !nextProjection.work_items.some((item) => item.work_id === work.work_id)
+        && !nextProjection.active_tab_work_cards.some((card) => card.workId === work.work_id),
+      30_000,
+      150,
+    );
+
+    expect(projection.work_items.some((item) => item.work_id === work.work_id)).toBe(false);
+  });
+
+  it('renders tile ports with the right modes and supports drag-connect plus disconnect on the canvas', async () => {
+    let projection = await createIsolatedTab(client, 'network-ports');
+    const agentPaneId = await spawnShellInActiveTab(client);
+    await client.agentRegister('agent-port-owner', agentPaneId, 'Port Owner');
+    const work = await client.toolbarSpawnWork('Port Wiring');
+
+    projection = await waitFor(
+      'agent tile and work card for port test',
+      () => client.getProjection(),
+      (nextProjection) =>
+        nextProjection.active_tab_terminals.some((terminal) => terminal.id === agentPaneId)
+        && nextProjection.agents.some((agent) => agent.agent_id === 'agent-port-owner')
+        && nextProjection.active_tab_work_cards.some((card) => card.workId === work.work_id),
+      30_000,
+      150,
+    );
+
+    const portSnapshot = await client.testDomQuery<{
+      agentLeft: string;
+      workLeft: string;
+      workTop: string;
+    }>(`
+      const agentLeft = document.querySelector('[data-port-tile="${agentPaneId}"][data-port="left"]');
+      const workLeft = document.querySelector('[data-port-tile="work:${work.work_id}"][data-port="left"]');
+      const workTop = document.querySelector('[data-port-tile="work:${work.work_id}"][data-port="top"]');
+      return {
+        agentLeft: agentLeft?.className ?? '',
+        workLeft: workLeft?.className ?? '',
+        workTop: workTop?.className ?? '',
+      };
+    `);
+
+    expect(portSnapshot.agentLeft).toContain('port-read-write');
+    expect(portSnapshot.workLeft).toContain('port-read-write');
+    expect(portSnapshot.workTop).toContain('port-read');
+
+    await client.testDomQuery(`
+      const source = document.querySelector('[data-port-tile="${agentPaneId}"][data-port="left"]');
+      const target = document.querySelector('[data-port-tile="work:${work.work_id}"][data-port="left"]');
+      if (!(source instanceof HTMLElement) || !(target instanceof HTMLElement)) {
+        throw new Error('missing port handles');
+      }
+      const sourceRect = source.getBoundingClientRect();
+      const targetRect = target.getBoundingClientRect();
+      source.dispatchEvent(new MouseEvent('mousedown', {
+        button: 0,
+        bubbles: true,
+        cancelable: true,
+        clientX: sourceRect.left + sourceRect.width / 2,
+        clientY: sourceRect.top + sourceRect.height / 2,
+      }));
+      window.dispatchEvent(new MouseEvent('mousemove', {
+        bubbles: true,
+        cancelable: true,
+        clientX: targetRect.left + targetRect.width / 2,
+        clientY: targetRect.top + targetRect.height / 2,
+      }));
+      target.dispatchEvent(new MouseEvent('mouseup', {
+        button: 0,
+        bubbles: true,
+        cancelable: true,
+        clientX: targetRect.left + targetRect.width / 2,
+        clientY: targetRect.top + targetRect.height / 2,
+      }));
+      return true;
+    `);
+
+    projection = await waitFor(
+      'network edge creation from drag connect',
+      () => client.getProjection(),
+      (nextProjection) =>
+        nextProjection.active_tab_network_connections.some(
+          (connection) =>
+            ((connection.from_tile_id === agentPaneId && connection.from_port === 'left')
+              && (connection.to_tile_id === `work:${work.work_id}` && connection.to_port === 'left'))
+            || ((connection.to_tile_id === agentPaneId && connection.to_port === 'left')
+              && (connection.from_tile_id === `work:${work.work_id}` && connection.from_port === 'left')),
+        ),
+      30_000,
+      150,
+    );
+
+    expect(projection.active_tab_network_connections).toHaveLength(1);
+
+    await client.testDomQuery(`
+      const source = document.querySelector('[data-port-tile="${agentPaneId}"][data-port="left"]');
+      if (!(source instanceof HTMLElement)) {
+        throw new Error('missing occupied source port');
+      }
+      const sourceRect = source.getBoundingClientRect();
+      source.dispatchEvent(new MouseEvent('mousedown', {
+        button: 0,
+        bubbles: true,
+        cancelable: true,
+        clientX: sourceRect.left + sourceRect.width / 2,
+        clientY: sourceRect.top + sourceRect.height / 2,
+      }));
+      window.dispatchEvent(new MouseEvent('mouseup', {
+        button: 0,
+        bubbles: true,
+        cancelable: true,
+        clientX: sourceRect.left - 40,
+        clientY: sourceRect.top - 40,
+      }));
+      return true;
+    `);
+
+    projection = await waitFor(
+      'network edge removal from disconnect drag',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.active_tab_network_connections.length === 0,
+      30_000,
+      150,
+    );
+
+    expect(projection.active_tab_network_connections).toHaveLength(0);
+  });
+
+  it('uses Shift+J/K to focus sidebar sections and j/k to select work and agent items on the canvas', async () => {
+    let projection = await createIsolatedTab(client, 'sidebar-focus');
+    const paneId = projection.selected_pane_id!;
+
+    const firstWork = await client.toolbarSpawnWork('Focus Work A');
+    const secondWork = await client.toolbarSpawnWork('Focus Work B');
+    await client.agentRegister('agent-focus', paneId, 'Focus Agent');
+    projection = await waitFor(
+      'agent registration in focused tab',
+      () => client.getProjection(),
+      (nextProjection) =>
+        nextProjection.agents.some((agent) => agent.agent_id === 'agent-focus')
+        && nextProjection.work_items.length >= 2,
+      30_000,
+      150,
+    );
+
+    await client.sidebarOpen();
+
+    await client.pressKeys([{ key: 'K', shift_key: true }], VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+    projection = await waitFor(
+      'agents sidebar section focus',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.sidebar.section === 'agents' && nextProjection.selected_pane_id === paneId,
+      30_000,
+      150,
+    );
+
+    await client.pressKeys([{ key: 'K', shift_key: true }], VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+    projection = await waitFor(
+      'work sidebar section focus',
+      () => client.getProjection(),
+      (nextProjection) =>
+        nextProjection.sidebar.section === 'work'
+        && [firstWork.work_id, secondWork.work_id].includes(nextProjection.selected_work_id ?? ''),
+      30_000,
+      150,
+    );
+
+    const initiallySelectedWorkId = projection.selected_work_id!;
+    const nextWorkId = initiallySelectedWorkId === firstWork.work_id ? secondWork.work_id : firstWork.work_id;
+
+    let selectedCanvasWork = await client.testDomQuery<string>(
+      `return document.querySelector('.work-card.selected-work-card')?.getAttribute('data-work-id') ?? '';`,
+    );
+    expect(selectedCanvasWork).toBe(initiallySelectedWorkId);
+
+    await client.pressKeys([{ key: 'j' }], VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+    projection = await waitFor(
+      'move within work sidebar section',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.selected_work_id === nextWorkId,
+      30_000,
+      150,
+    );
+
+    selectedCanvasWork = await client.testDomQuery<string>(
+      `return document.querySelector('.work-card.selected-work-card')?.getAttribute('data-work-id') ?? '';`,
+    );
+    expect(selectedCanvasWork).toBe(nextWorkId);
+
+    await client.pressKeys([{ key: 'J', shift_key: true }], VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
+    projection = await waitFor(
+      'return to agents sidebar section',
+      () => client.getProjection(),
+      (nextProjection) => nextProjection.sidebar.section === 'agents' && nextProjection.selected_pane_id === paneId,
+      30_000,
+      150,
+    );
+  });
+
+  it('covers shell create, tile selection/close, sidebar rename, and canvas actions through the typed driver', async () => {
     expect(createdSessionId).toBeTruthy();
 
     await client.toolbarSelectTab(createdSessionId!);
@@ -358,21 +875,20 @@ describe.sequential('in-app test driver', () => {
   });
 
   it('confirms multi-window tab closes through the typed driver only', async () => {
-    await client.toolbarSelectTab(createdSessionId!);
-    await client.waitForIdle();
+    let projection = await createIsolatedTab(client, 'driver-close-tab');
+    const activeSessionId = projection.active_tab_id;
+    expect(activeSessionId).toBeTruthy();
 
     await client.pressKeys([{ key: 's' }], VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
     await waitFor(
       'second shell before tab close',
       () => client.getProjection(),
-      (nextProjection) => nextProjection.active_tab_id === createdSessionId && nextProjection.active_tab_terminals.length > 1,
+      (nextProjection) => nextProjection.active_tab_id === activeSessionId && nextProjection.active_tab_terminals.length > 1,
       30_000,
       150,
     );
 
-    let projection = await client.getProjection();
-    const activeSessionId = projection.active_tab_id;
-    expect(activeSessionId).toBe(createdSessionId);
+    projection = await client.getProjection();
     expect(projection.active_tab_terminals.length).toBeGreaterThan(1);
 
     await client.pressKeys([{ key: 'X' }], VIEWPORT_WIDTH, VIEWPORT_HEIGHT);
@@ -388,7 +904,13 @@ describe.sequential('in-app test driver', () => {
     await client.confirmCloseTab();
     await client.waitForIdle(30_000, 250);
 
-    projection = await client.getProjection();
+    projection = await waitFor(
+      'closed multi-window tab',
+      () => client.getProjection(),
+      (nextProjection) => !nextProjection.tabs.some((tab) => tab.id === activeSessionId),
+      30_000,
+      150,
+    );
     expect(projection.tabs.some((tab) => tab.id === activeSessionId)).toBe(false);
     expect(projection.indicators.tmux).toBe(true);
     expect(projection.indicators.cc).toBe(true);

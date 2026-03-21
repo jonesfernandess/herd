@@ -9,7 +9,7 @@ pub struct RuntimeConfig {
     socket_path: String,
     socket_log_path: String,
     cc_log_path: String,
-    state_path: String,
+    database_path: String,
     dom_result_path: String,
     test_driver_enabled: bool,
 }
@@ -40,7 +40,7 @@ fn build_runtime_config() -> RuntimeConfig {
     let project_tmp_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tmp");
 
     RuntimeConfig {
-        runtime_id,
+        runtime_id: runtime_id.clone(),
         tmux_server_name: runtime_name.clone(),
         session_name: runtime_name.clone(),
         socket_path: format!("/tmp/{runtime_name}.sock"),
@@ -52,8 +52,8 @@ fn build_runtime_config() -> RuntimeConfig {
             .join(format!("{runtime_name}-cc.log"))
             .to_string_lossy()
             .to_string(),
-        state_path: project_tmp_dir
-            .join(format!("{runtime_name}-state.json"))
+        database_path: project_tmp_dir
+            .join(database_file_name(runtime_id.as_deref()))
             .to_string_lossy()
             .to_string(),
         dom_result_path: format!("/tmp/{runtime_name}-dom-result.json"),
@@ -90,8 +90,8 @@ pub fn cc_log_path() -> &'static str {
     config().cc_log_path.as_str()
 }
 
-pub fn state_path() -> &'static str {
-    config().state_path.as_str()
+pub fn database_path() -> &'static str {
+    config().database_path.as_str()
 }
 
 pub fn dom_result_path() -> &'static str {
@@ -102,6 +102,51 @@ pub fn project_tmp_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../tmp")
 }
 
+fn database_file_name(runtime_id: Option<&str>) -> String {
+    runtime_id
+        .map(|value| format!("herd-{value}.sqlite"))
+        .unwrap_or_else(|| "herd.sqlite".to_string())
+}
+
+fn looks_like_project_root(path: &Path) -> bool {
+    path.join(".mcp.json").is_file()
+        && path.join("mcp-server").is_dir()
+        && path.join("src-tauri").is_dir()
+}
+
+fn detect_project_root_from(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(path) = current {
+        if looks_like_project_root(path) {
+            return Some(path.to_path_buf());
+        }
+        current = path.parent();
+    }
+    None
+}
+
+pub fn project_root_dir() -> PathBuf {
+    let manifest_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf());
+    if looks_like_project_root(&manifest_root) {
+        return manifest_root;
+    }
+
+    if let Ok(current) = std::env::current_dir() {
+        if let Some(root) = detect_project_root_from(&current) {
+            return root;
+        }
+    }
+
+    manifest_root
+}
+
+pub fn project_mcp_config_path() -> PathBuf {
+    project_root_dir().join(".mcp.json")
+}
+
 pub fn tmux_socket_file_path() -> PathBuf {
     let uid = unsafe { libc::geteuid() };
     PathBuf::from(format!("/private/tmp/tmux-{uid}/{}", tmux_server_name()))
@@ -109,4 +154,51 @@ pub fn tmux_socket_file_path() -> PathBuf {
 
 pub fn test_driver_enabled() -> bool {
     config().test_driver_enabled
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{database_file_name, detect_project_root_from, looks_like_project_root};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let base = std::env::temp_dir().join(format!("herd-runtime-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[test]
+    fn project_root_detection_walks_up_to_repo_markers() {
+        let root = temp_dir("project-root");
+        fs::write(root.join(".mcp.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("mcp-server")).unwrap();
+        fs::create_dir_all(root.join("src-tauri")).unwrap();
+        fs::create_dir_all(root.join("src-tauri/src")).unwrap();
+
+        let nested = root.join("src-tauri/src");
+        let detected = detect_project_root_from(&nested).unwrap();
+        assert_eq!(detected, root);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_root_detection_requires_herd_layout() {
+        let root = temp_dir("mcp-root");
+        fs::write(root.join(".mcp.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("nested/deeper")).unwrap();
+
+        assert!(detect_project_root_from(&root.join("nested/deeper")).is_none());
+        assert!(!looks_like_project_root(&root));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn database_file_name_uses_runtime_suffix() {
+        assert_eq!(database_file_name(None), "herd.sqlite");
+        assert_eq!(database_file_name(Some("dev")), "herd-dev.sqlite");
+    }
 }

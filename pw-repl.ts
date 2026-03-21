@@ -87,7 +87,7 @@ async function main() {
         const d = await page.$eval('#herd-debug', (el: any) => el.textContent).catch(() => '(none)');
         console.log(`Debug: ${d}`);
       } else if (line === 'shells') {
-        const resp = await sockCmd({ command: 'list_shells' });
+        const resp = await sockCmd({ command: 'shell_list' });
         for (const s of resp.data) {
           console.log(`  ${s.pane_id} sid=${s.id.slice(0, 8)}`);
         }

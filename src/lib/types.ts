@@ -3,6 +3,7 @@ export interface TerminalInfo {
   paneId: string;
   windowId: string;
   parentWindowId?: string | null;
+  parentWindowSource?: WindowParentSource | null;
   sessionId: string;
   tabId: string;
   x: number;
@@ -13,6 +14,7 @@ export interface TerminalInfo {
   command: string;
   readOnly?: boolean;
   kind?: PaneKind;
+  agentId?: string | null;
 }
 
 export interface CanvasState {
@@ -21,7 +23,188 @@ export interface CanvasState {
   zoom: number;
 }
 
-export type PaneKind = 'regular' | 'claude' | 'output';
+export type PaneKind = 'regular' | 'claude' | 'root_agent' | 'browser' | 'output';
+export type DebugTab = 'info' | 'chatter' | 'logs';
+export type AgentType = 'claude';
+export type AgentRole = 'root' | 'worker';
+export type SidebarSection = 'settings' | 'work' | 'agents' | 'tmux';
+export type TilePort = 'left' | 'top' | 'right' | 'bottom';
+export type PortMode = 'read' | 'read_write';
+export type NetworkTileKind = 'agent' | 'root_agent' | 'shell' | 'output' | 'work' | 'browser';
+export type WindowParentSource = 'hook' | 'manual';
+
+export interface AgentInfo {
+  agent_id: string;
+  agent_type: AgentType;
+  agent_role: AgentRole;
+  tile_id: string;
+  window_id: string;
+  session_id: string;
+  title: string;
+  display_name: string;
+  alive: boolean;
+  chatter_subscribed: boolean;
+  topics: string[];
+  agent_pid?: number | null;
+}
+
+export interface TopicInfo {
+  session_id: string;
+  name: string;
+  subscriber_count: number;
+  last_activity_at?: number | null;
+}
+
+export type AgentLogKind = 'incoming_hook' | 'outgoing_call';
+
+export interface AgentLogEntry {
+  session_id: string;
+  agent_id: string;
+  tile_id: string;
+  kind: AgentLogKind;
+  text: string;
+  timestamp_ms: number;
+}
+
+export type WorkStage = 'plan' | 'prd' | 'artifact';
+export type WorkStageStatus = 'ready' | 'in_progress' | 'completed' | 'approved';
+export type WorkReviewDecision = 'approve' | 'improve';
+
+export interface WorkStageState {
+  stage: WorkStage;
+  status: WorkStageStatus;
+  file_path: string;
+}
+
+export interface WorkReviewEntry {
+  stage: WorkStage;
+  decision: WorkReviewDecision;
+  comment?: string | null;
+  created_at: number;
+}
+
+export interface WorkItem {
+  work_id: string;
+  session_id: string;
+  title: string;
+  topic: string;
+  owner_agent_id?: string | null;
+  current_stage: WorkStage;
+  stages: WorkStageState[];
+  reviews: WorkReviewEntry[];
+  created_at: number;
+  updated_at: number;
+}
+
+export interface NetworkConnection {
+  session_id: string;
+  from_tile_id: string;
+  from_port: TilePort;
+  to_tile_id: string;
+  to_port: TilePort;
+}
+
+export type TileTypeFilter = 'agent' | 'shell' | 'browser' | 'work';
+
+export interface AgentTileDetails {
+  agent_id: string;
+  agent_type: AgentType;
+  agent_role: AgentRole;
+  display_name: string;
+  alive: boolean;
+  chatter_subscribed: boolean;
+  topics: string[];
+  agent_pid?: number | null;
+}
+
+export interface PaneTileDetails {
+  window_name: string;
+  window_index: number;
+  pane_index: number;
+  cols: number;
+  rows: number;
+  active: boolean;
+  dead: boolean;
+}
+
+export interface BrowserTileDetails extends PaneTileDetails {
+  current_url?: string | null;
+}
+
+export interface WorkTileDetails {
+  work_id: string;
+  topic: string;
+  owner_agent_id?: string | null;
+  current_stage: WorkStage;
+  stages: WorkStageState[];
+  reviews: WorkReviewEntry[];
+  created_at: number;
+  updated_at: number;
+}
+
+export type TileDetails = AgentTileDetails | PaneTileDetails | BrowserTileDetails | WorkTileDetails;
+
+export interface SessionTileInfo {
+  tile_id: string;
+  session_id: string;
+  kind: NetworkTileKind;
+  title: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pane_id?: string | null;
+  window_id?: string | null;
+  parent_window_id?: string | null;
+  parent_window_source?: WindowParentSource | null;
+  command?: string | null;
+  details: TileDetails;
+}
+
+export interface TileGraph {
+  session_id: string;
+  tiles: SessionTileInfo[];
+  connections: NetworkConnection[];
+}
+
+export type ChatterKind = 'direct' | 'public' | 'network' | 'root' | 'sign_on' | 'sign_off';
+
+export interface ChatterEntry {
+  session_id: string;
+  kind: ChatterKind;
+  from_agent_id?: string | null;
+  from_display_name: string;
+  to_agent_id?: string | null;
+  to_display_name?: string | null;
+  message: string;
+  topics: string[];
+  mentions: string[];
+  timestamp_ms: number;
+  public: boolean;
+  display_text: string;
+}
+
+export interface AgentActivityEntry {
+  kind: 'incoming_dm' | 'outgoing_dm' | 'outgoing_chatter' | 'mention' | 'topic' | 'incoming_hook' | 'outgoing_call';
+  text: string;
+  timestamp_ms: number;
+}
+
+export interface WorkCanvasCard {
+  workId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface AgentDebugState {
+  agents: AgentInfo[];
+  topics: TopicInfo[];
+  chatter: ChatterEntry[];
+  agent_logs: AgentLogEntry[];
+  connections: NetworkConnection[];
+}
 
 export type ContextMenuTarget = 'canvas' | 'pane';
 
@@ -80,6 +263,13 @@ export interface CloseTabConfirmation {
   paneCount: number;
 }
 
+export interface ClosePaneConfirmation {
+  paneId: string;
+  title: string;
+  message: string;
+  confirmLabel: string;
+}
+
 export interface Tab {
   id: string;
   name: string;
@@ -104,6 +294,7 @@ export interface TmuxSession {
   active: boolean;
   window_ids: string[];
   active_window_id: string | null;
+  root_cwd?: string | null;
 }
 
 export interface TmuxWindow {
@@ -117,6 +308,7 @@ export interface TmuxWindow {
   rows: number;
   pane_ids: string[];
   parent_window_id?: string | null;
+  parent_window_source?: WindowParentSource | null;
 }
 
 export interface TmuxPane {
@@ -164,15 +356,20 @@ export interface UiState {
   commandText: string;
   helpOpen: boolean;
   sidebarOpen: boolean;
+  sidebarSection: SidebarSection;
   sidebarSelectedIdx: number;
   debugPaneOpen: boolean;
+  debugPaneHeight: number;
+  debugTab: DebugTab;
   selectedPaneId: string | null;
+  selectedWorkId: string | null;
   paneViewportHints: Record<string, PaneViewportHint>;
   arrangementCycleBySession: Record<string, number>;
   arrangementModeBySession: Record<string, ArrangementMode | null>;
   canvas: CanvasState;
   zoomBookmark: CanvasZoomBookmark | null;
   closeTabConfirmation: CloseTabConfirmation | null;
+  closePaneConfirmation: ClosePaneConfirmation | null;
   contextMenu: ContextMenuState | null;
   pendingSpawnPlacement: PendingSpawnPlacement | null;
 }
@@ -198,6 +395,17 @@ export interface LayoutStateSlice {
 export interface AppStateTree {
   tmux: TmuxStateSlice;
   layout: LayoutStateSlice;
+  agents: Record<string, AgentInfo>;
+  topics: Record<string, TopicInfo>;
+  chatter: ChatterEntry[];
+  agentLogs: AgentLogEntry[];
+  network: {
+    connections: NetworkConnection[];
+  };
+  work: {
+    items: Record<string, WorkItem>;
+    order: string[];
+  };
   ui: UiState;
 }
 
@@ -234,6 +442,8 @@ export type TestDriverRequest =
   | { type: 'toolbar_select_tab'; session_id: string }
   | { type: 'toolbar_add_tab'; name?: string | null }
   | { type: 'toolbar_spawn_shell' }
+  | { type: 'toolbar_spawn_agent' }
+  | { type: 'toolbar_spawn_work'; title: string }
   | { type: 'sidebar_open' }
   | { type: 'sidebar_close' }
   | { type: 'sidebar_select_item'; index: number }
@@ -276,10 +486,12 @@ export interface TestDriverProjection {
   help_open: boolean;
   sidebar: {
     open: boolean;
+    section: SidebarSection;
     selected_index: number;
     items: SidebarTreeItem[];
   };
   close_tab_confirmation: CloseTabConfirmation | null;
+  close_pane_confirmation: ClosePaneConfirmation | null;
   context_menu: {
     target: ContextMenuTarget;
     pane_id: string | null;
@@ -294,6 +506,14 @@ export interface TestDriverProjection {
     items: ContextMenuItem[];
   } | null;
   selected_pane_id: string | null;
+  selected_work_id: string | null;
+  debug_tab: DebugTab;
+  agents: AgentInfo[];
+  topics: TopicInfo[];
+  chatter: ChatterEntry[];
+  agent_logs: AgentLogEntry[];
+  agent_activity_by_pane: Record<string, AgentActivityEntry[]>;
+  work_items: WorkItem[];
   canvas: CanvasState;
   tabs: Tab[];
   active_tab_id: string | null;
@@ -310,6 +530,8 @@ export interface TestDriverProjection {
     cx2: number;
     cy2: number;
   }>;
+  active_tab_network_connections: NetworkConnection[];
+  active_tab_work_cards: WorkCanvasCard[];
   indicators: {
     tmux: boolean;
     cc: boolean;

@@ -1,4 +1,9 @@
+mod agent;
+mod browser;
+mod cli;
 mod commands;
+mod db;
+mod network;
 mod persist;
 mod runtime;
 mod socket;
@@ -6,11 +11,61 @@ mod state;
 mod tmux;
 mod tmux_control;
 mod tmux_state;
+mod work;
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 use tauri::{Listener, Manager};
 use state::AppState;
 
 const DEFAULT_WEBVIEW_ZOOM: f64 = 1.5;
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn cli_shim_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".local/bin/herd"))
+}
+
+fn ensure_cli_shim() -> Result<(), String> {
+    let Some(shim_path) = cli_shim_path() else {
+        return Ok(());
+    };
+    let parent = shim_path
+        .parent()
+        .ok_or_else(|| "failed to resolve herd shim directory".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("failed to resolve current executable: {error}"))?;
+    let script = format!(
+        "#!/bin/sh\nexec {} \"$@\"\n",
+        shell_single_quote(&executable.to_string_lossy())
+    );
+
+    let needs_write = match fs::read_to_string(&shim_path) {
+        Ok(current) => current != script,
+        Err(_) => true,
+    };
+    if needs_write {
+        fs::write(&shim_path, script)
+            .map_err(|error| format!("failed to write {}: {error}", shim_path.display()))?;
+    }
+
+    let mut permissions = fs::metadata(&shim_path)
+        .map_err(|error| format!("failed to read {} metadata: {error}", shim_path.display()))?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&shim_path, permissions)
+        .map_err(|error| format!("failed to chmod {}: {error}", shim_path.display()))?;
+
+    Ok(())
+}
 
 fn connect_tmux_control(
     handle: tauri::AppHandle,
@@ -56,20 +111,40 @@ fn connect_tmux_control(
     }
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
+fn run_gui() {
     tauri::Builder::default()
         .manage(AppState::new())
         .invoke_handler(tauri::generate_handler![
+            browser::browser_webview_sync,
+            browser::browser_webview_navigate,
+            browser::browser_webview_reload,
+            browser::browser_webview_back,
+            browser::browser_webview_forward,
+            browser::browser_webview_hide,
             commands::get_tmux_state,
             commands::get_layout_state,
+            commands::get_agent_debug_state,
+            commands::get_work_items,
+            commands::send_root_message_command,
+            commands::send_direct_message_command,
+            commands::send_public_message_command,
+            commands::create_work_item,
+            commands::delete_work_item,
+            commands::approve_work_item,
+            commands::improve_work_item,
+            commands::read_work_stage_preview,
+            commands::connect_network_tiles,
+            commands::disconnect_network_port,
             commands::get_claude_menu_data_for_pane,
             commands::save_layout_state,
             commands::new_session,
             commands::kill_session,
             commands::select_session,
             commands::rename_session,
+            commands::set_session_root_cwd,
             commands::new_window,
+            commands::spawn_agent_window,
+            commands::spawn_browser_window,
             commands::split_pane,
             commands::kill_window,
             commands::kill_pane,
@@ -102,6 +177,10 @@ pub fn run() {
                 )?;
             }
 
+            if let Err(error) = ensure_cli_shim() {
+                log::warn!("Failed to refresh ~/.local/bin/herd shim: {error}");
+            }
+
             // Ensure tmux server and session exist
             let already_running = tmux::is_running();
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
@@ -122,6 +201,15 @@ pub fn run() {
                     &shell,
                 ]) {
                     Ok(output) if output.status.success() => {
+                        let _ = crate::tmux_state::set_session_env(
+                            runtime::session_name(),
+                            "HERD_SOCK",
+                            runtime::socket_path(),
+                        );
+                        let _ = crate::tmux_state::set_session_root_cwd(
+                            runtime::session_name(),
+                            &runtime::project_root_dir().to_string_lossy(),
+                        );
                         log::info!("Created tmux session '{}'", runtime::session_name())
                     }
                     Ok(output) => log::error!(
@@ -131,6 +219,12 @@ pub fn run() {
                     Err(error) => log::error!("Failed to create tmux session: {error}"),
                 }
             } else {
+                let _ = crate::tmux_state::set_session_env(
+                    runtime::session_name(),
+                    "HERD_SOCK",
+                    runtime::socket_path(),
+                );
+                let _ = crate::tmux_state::ensure_session_root_cwd(runtime::session_name());
                 log::info!("tmux server already running, reconnecting");
             }
 
@@ -149,6 +243,23 @@ pub fn run() {
             match connect_tmux_control(handle.clone(), state.inner(), state.last_active_session()) {
                 Ok(attach_session) => {
                     log::info!("tmux control mode connected to '{attach_session}'");
+                    let reuse_primary_pane = !already_running;
+                    if let Ok(snapshot) = crate::tmux_state::snapshot(state.inner()) {
+                        for session in snapshot.sessions {
+                            let _ = crate::tmux_state::set_session_env(
+                                &session.id,
+                                "HERD_SOCK",
+                                runtime::socket_path(),
+                            );
+                            if let Err(error) = crate::commands::ensure_root_agent_for_session(
+                                app.handle().clone(),
+                                session.id.clone(),
+                                reuse_primary_pane && session.id == attach_session,
+                            ) {
+                                log::warn!("Failed to ensure root agent for session {}: {error}", session.id);
+                            }
+                        }
+                    }
                     let _ = crate::tmux_state::emit_snapshot(&app.handle());
                 }
                 Err(e) => {
@@ -216,4 +327,17 @@ pub fn run() {
                 // Don't kill tmux — sessions survive restarts
             }
         });
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run_entry(args: Vec<String>) {
+    if cli::is_cli_invocation(&args) {
+        if let Err(error) = cli::run(args) {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    run_gui();
 }

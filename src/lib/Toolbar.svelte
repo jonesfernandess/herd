@@ -3,13 +3,18 @@
   import { invoke } from '@tauri-apps/api/core';
   import { canvasState } from './stores/canvas';
   import { tabs, activeTabId, addTab, activeTabTerminals } from './stores/tabs';
+  import { agentInfos } from './stores/appState';
 
   interface Props {
     onSpawnShell: () => void;
+    onSpawnAgent: () => void;
+    onSpawnBrowser: () => void;
+    onSpawnWork: () => void;
   }
-  let { onSpawnShell }: Props = $props();
+  let { onSpawnShell, onSpawnAgent, onSpawnBrowser, onSpawnWork }: Props = $props();
 
   let termCount = $derived($activeTabTerminals.length);
+  let agentCount = $derived($agentInfos.filter((agent) => agent.session_id === $activeTabId && agent.alive).length);
   let zoomPct = $derived(Math.round($canvasState.zoom * 100));
 
   let tmuxAlive = $state(false);
@@ -86,12 +91,31 @@
       <span class="btn-icon">+</span>
       <span class="btn-label">SHELL</span>
     </button>
+
+    <button class="tool-btn spawn agent" onclick={onSpawnAgent}>
+      <span class="btn-icon">+</span>
+      <span class="btn-label">AGENT</span>
+    </button>
+
+    <button class="tool-btn spawn browser" onclick={onSpawnBrowser}>
+      <span class="btn-icon">+</span>
+      <span class="btn-label">BROWSER</span>
+    </button>
+
+    <button class="tool-btn spawn work" onclick={onSpawnWork}>
+      <span class="btn-icon">+</span>
+      <span class="btn-label">WORK</span>
+    </button>
   </div>
 
   <div class="toolbar-right">
     <div class="status-block">
       <span class="status-label">NODES</span>
       <span class="status-value">{termCount}</span>
+    </div>
+    <div class="status-block">
+      <span class="status-label">AGENTS</span>
+      <span class="status-value">{agentCount}</span>
     </div>
     <div class="status-block">
       <span class="status-label">ZOOM</span>
@@ -233,6 +257,48 @@
     border-color: var(--phosphor-green-dim);
     color: var(--phosphor-green);
     background: rgba(51, 255, 51, 0.05);
+  }
+
+  .tool-btn.agent {
+    border-color: rgba(242, 176, 90, 0.45);
+  }
+
+  .tool-btn.agent .btn-icon {
+    color: var(--copper);
+  }
+
+  .tool-btn.agent:hover {
+    border-color: var(--copper);
+    color: var(--copper);
+    background: rgba(242, 176, 90, 0.08);
+  }
+
+  .tool-btn.work {
+    border-color: rgba(110, 188, 255, 0.45);
+  }
+
+  .tool-btn.work .btn-icon {
+    color: #6ebcff;
+  }
+
+  .tool-btn.work:hover {
+    border-color: #6ebcff;
+    color: #6ebcff;
+    background: rgba(110, 188, 255, 0.08);
+  }
+
+  .tool-btn.browser {
+    border-color: rgba(102, 225, 255, 0.45);
+  }
+
+  .tool-btn.browser .btn-icon {
+    color: #66e1ff;
+  }
+
+  .tool-btn.browser:hover {
+    border-color: #66e1ff;
+    color: #66e1ff;
+    background: rgba(102, 225, 255, 0.08);
   }
 
   .btn-icon {

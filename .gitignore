@@ -17,10 +17,19 @@ src-tauri/target/
 
 # Runtime logs
 log/
+src-tauri/log/
+
+# Local runtime state
+tmp/
+work/
 
 # MCP server build
 mcp-server/dist/
 mcp-server/node_modules/
+
+# Python cache
+__pycache__/
+*.py[cod]
 
 # Editor directories and files
 .vscode/*

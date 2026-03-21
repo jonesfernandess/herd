@@ -1,22 +1,31 @@
 <script lang="ts">
-  import { closeTabConfirmation, dispatchIntent } from './stores/appState';
+  import { closePaneConfirmation, closeTabConfirmation, dispatchIntent } from './stores/appState';
 </script>
 
-{#if $closeTabConfirmation}
+{#if $closePaneConfirmation || $closeTabConfirmation}
   <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
-  <div class="confirm-overlay" onclick={() => void dispatchIntent({ type: 'cancel-close-active-tab' })}>
+  <div
+    class="confirm-overlay"
+    onclick={() => void dispatchIntent($closePaneConfirmation ? { type: 'cancel-close-pane' } : { type: 'cancel-close-active-tab' })}
+  >
     <!-- svelte-ignore a11y_no_static_element_interactions a11y_click_events_have_key_events -->
     <div class="confirm-pane" onclick={(e) => e.stopPropagation()}>
-      <div class="confirm-title">CLOSE TAB</div>
+      <div class="confirm-title">{$closePaneConfirmation?.title ?? 'CLOSE TAB'}</div>
       <div class="confirm-message">
-        Close "{$closeTabConfirmation.sessionName}" and kill {$closeTabConfirmation.paneCount} panes?
+        {$closePaneConfirmation?.message ?? `Close "${$closeTabConfirmation!.sessionName}" and kill ${$closeTabConfirmation!.paneCount} panes?`}
       </div>
       <div class="confirm-actions">
-        <button class="confirm-button" onclick={() => void dispatchIntent({ type: 'cancel-close-active-tab' })}>
+        <button
+          class="confirm-button"
+          onclick={() => void dispatchIntent($closePaneConfirmation ? { type: 'cancel-close-pane' } : { type: 'cancel-close-active-tab' })}
+        >
           Cancel
         </button>
-        <button class="confirm-button danger" onclick={() => void dispatchIntent({ type: 'confirm-close-active-tab' })}>
-          Close Tab
+        <button
+          class="confirm-button danger"
+          onclick={() => void dispatchIntent($closePaneConfirmation ? { type: 'confirm-close-pane' } : { type: 'confirm-close-active-tab' })}
+        >
+          {$closePaneConfirmation?.confirmLabel ?? 'Close Tab'}
         </button>
       </div>
     </div>

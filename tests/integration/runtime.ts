@@ -95,6 +95,7 @@ export async function startIntegrationRuntime(): Promise<HerdIntegrationRuntime>
   const socketLogPath = path.join(ROOT_DIR, 'tmp', `${name}-socket.log`);
   const ccLogPath = path.join(ROOT_DIR, 'tmp', `${name}-cc.log`);
   const statePath = path.join(ROOT_DIR, 'tmp', `${name}-state.json`);
+  const databasePath = path.join(ROOT_DIR, 'tmp', `herd-${runtimeId}.sqlite`);
   const domResultPath = `/tmp/${name}-dom-result.json`;
   const configPath = path.join(os.tmpdir(), `${name}-tauri-dev.json`);
   const port = await reservePort();
@@ -145,6 +146,9 @@ export async function startIntegrationRuntime(): Promise<HerdIntegrationRuntime>
       removeIfExists(socketLogPath),
       removeIfExists(ccLogPath),
       removeIfExists(statePath),
+      removeIfExists(databasePath),
+      removeIfExists(`${databasePath}-shm`),
+      removeIfExists(`${databasePath}-wal`),
       removeIfExists(domResultPath),
     ]);
     throw new Error(`${error instanceof Error ? error.message : String(error)}\n\n${getLogs()}`);
@@ -165,6 +169,9 @@ export async function startIntegrationRuntime(): Promise<HerdIntegrationRuntime>
         removeIfExists(socketLogPath),
         removeIfExists(ccLogPath),
         removeIfExists(statePath),
+        removeIfExists(databasePath),
+        removeIfExists(`${databasePath}-shm`),
+        removeIfExists(`${databasePath}-wal`),
         removeIfExists(domResultPath),
       ]);
     },

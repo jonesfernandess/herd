@@ -1,16 +1,27 @@
 <script lang="ts">
+  import BrowserTile from './BrowserTile.svelte';
   import ContextMenu from './ContextMenu.svelte';
   import TerminalTile from './TerminalTile.svelte';
+  import WorkCard from './WorkCard.svelte';
   import {
+    activeNetworkDrag,
     activeTabConnections,
+    activeTabWorkCards,
+    activeSessionWorkItems,
     activeTabTerminals,
     canvasState,
+    clearNetworkReleaseAnimation,
+    completeNetworkPortDrag,
+    debugPaneHeight,
     debugPaneOpen,
     dismissContextMenu,
     mode,
+    networkReleaseAnimation,
     openCanvasContextMenu,
     panCanvasBy,
     sidebarOpen,
+    updateNetworkPortDrag,
+    visibleActiveTabNetworkConnections,
     wheelCanvas,
   } from './stores/appState';
 
@@ -19,6 +30,84 @@
   let lastY = 0;
   let cursorWorldX = $state(0);
   let cursorWorldY = $state(0);
+  let workCardLayouts = $derived(new Map($activeTabWorkCards.map((card) => [card.workId, card])));
+  let releaseAnimationProgress = $state(1);
+  let effectiveSidebarWidth = $derived($sidebarOpen ? 240 : 0);
+  let effectiveDebugHeight = $derived(
+    $debugPaneOpen && Number.isFinite($debugPaneHeight) && $debugPaneHeight > 0 ? $debugPaneHeight : 0,
+  );
+
+  const NETWORK_RELEASE_DURATION_MS = 180;
+
+  type TilePort = 'left' | 'top' | 'right' | 'bottom';
+
+  function draftTargetPort() {
+    const drag = $activeNetworkDrag;
+    if (!drag) return 'right' as TilePort;
+    if (drag.snappedPort) return drag.snappedPort;
+    const dx = (drag.snappedX ?? drag.currentX) - drag.startX;
+    const dy = (drag.snappedY ?? drag.currentY) - drag.startY;
+    if (Math.abs(dx) >= Math.abs(dy)) {
+      return dx >= 0 ? 'left' : 'right';
+    }
+    return dy >= 0 ? 'top' : 'bottom';
+  }
+
+  function portVector(port: TilePort) {
+    switch (port) {
+      case 'left':
+        return { x: -1, y: 0 };
+      case 'top':
+        return { x: 0, y: -1 };
+      case 'right':
+        return { x: 1, y: 0 };
+      case 'bottom':
+        return { x: 0, y: 1 };
+    }
+  }
+
+  function curvedPath(x1: number, y1: number, fromPort: TilePort, x2: number, y2: number, toPort: TilePort) {
+    const distance = Math.hypot(x2 - x1, y2 - y1);
+    const handle = Math.max(36, Math.min(120, distance * 0.45));
+    const fromVector = portVector(fromPort);
+    const toVector = portVector(toPort);
+    const cx1 = x1 + fromVector.x * handle;
+    const cy1 = y1 + fromVector.y * handle;
+    const cx2 = x2 + toVector.x * handle;
+    const cy2 = y2 + toVector.y * handle;
+    return `M ${x1} ${y1} C ${cx1} ${cy1}, ${cx2} ${cy2}, ${x2} ${y2}`;
+  }
+
+  function easedReleaseProgress(progress: number) {
+    return 1 - (1 - progress) ** 3;
+  }
+
+  $effect(() => {
+    const animation = $networkReleaseAnimation;
+    if (!animation) {
+      releaseAnimationProgress = 1;
+      return;
+    }
+
+    releaseAnimationProgress = 0;
+    let frame = 0;
+    const startedAt = performance.now();
+
+    const step = (now: number) => {
+      const progress = Math.min(1, (now - startedAt) / NETWORK_RELEASE_DURATION_MS);
+      releaseAnimationProgress = progress;
+      if (progress >= 1) {
+        clearNetworkReleaseAnimation();
+        return;
+      }
+      frame = requestAnimationFrame(step);
+    };
+
+    frame = requestAnimationFrame(step);
+    return () => {
+      cancelAnimationFrame(frame);
+    };
+  });
 
   function handleWheel(e: WheelEvent) {
     if ($mode === 'input') {
@@ -47,6 +136,7 @@
     if (rect) {
       cursorWorldX = Math.round((e.clientX - rect.left - state.panX) / state.zoom);
       cursorWorldY = Math.round((e.clientY - rect.top - state.panY) / state.zoom);
+      updateNetworkPortDrag(e.clientX - rect.left, e.clientY - rect.top);
     }
 
     if (!isPanning) return;
@@ -59,6 +149,7 @@
 
   function handleMouseUp() {
     isPanning = false;
+    void completeNetworkPortDrag();
   }
 
   function handleContextMenu(e: MouseEvent) {
@@ -73,7 +164,7 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   class="canvas-viewport"
-  style="--sidebar-width: {$sidebarOpen ? '240px' : '0px'}; --debug-height: {$debugPaneOpen ? '200px' : '0px'}"
+  style={`left: ${effectiveSidebarWidth}px; bottom: ${22 + effectiveDebugHeight}px;`}
   onwheel={handleWheel}
   onmousedown={handleMouseDown}
   onmousemove={handleMouseMove}
@@ -98,6 +189,19 @@
       </svg>
     {/if}
 
+    {#if $visibleActiveTabNetworkConnections.length > 0}
+      <svg class="network-svg">
+        {#each $visibleActiveTabNetworkConnections as conn (`${conn.fromTileId}:${conn.fromPort}-${conn.toTileId}:${conn.toPort}`)}
+          <path
+            d={`M ${conn.x1} ${conn.y1} C ${conn.cx1} ${conn.cy1}, ${conn.cx2} ${conn.cy2}, ${conn.x2} ${conn.y2}`}
+            class="network-line"
+          />
+          <circle cx={conn.x1} cy={conn.y1} r="4" class="network-dot" />
+          <circle cx={conn.x2} cy={conn.y2} r="4" class="network-dot" />
+        {/each}
+      </svg>
+    {/if}
+
     <div class="origin-mark">
       <div class="origin-h"></div>
       <div class="origin-v"></div>
@@ -105,9 +209,82 @@
     </div>
 
     {#each $activeTabTerminals as term (term.id)}
-      <TerminalTile info={term} />
+      {#if term.kind === 'browser'}
+        <BrowserTile info={term} />
+      {:else}
+        <TerminalTile info={term} />
+      {/if}
+    {/each}
+
+    {#each $activeSessionWorkItems as item (item.work_id)}
+      {@const layout = workCardLayouts.get(item.work_id)}
+      {#if layout}
+        <WorkCard {item} {layout} />
+      {/if}
     {/each}
   </div>
+
+  {#if $activeNetworkDrag}
+    <svg class="network-draft-svg">
+      <path
+        d={curvedPath(
+          $activeNetworkDrag.startX,
+          $activeNetworkDrag.startY,
+          $activeNetworkDrag.port,
+          $activeNetworkDrag.snappedX ?? $activeNetworkDrag.currentX,
+          $activeNetworkDrag.snappedY ?? $activeNetworkDrag.currentY,
+          draftTargetPort(),
+        )}
+        class="network-draft-line"
+      />
+      <circle
+        cx={$activeNetworkDrag.startX}
+        cy={$activeNetworkDrag.startY}
+        r="4"
+        class="network-dot"
+      />
+      <circle
+        cx={$activeNetworkDrag.snappedX ?? $activeNetworkDrag.currentX}
+        cy={$activeNetworkDrag.snappedY ?? $activeNetworkDrag.currentY}
+        r="4"
+        class="network-dot"
+      />
+    </svg>
+  {/if}
+
+  {#if $networkReleaseAnimation}
+    {@const retract = easedReleaseProgress(releaseAnimationProgress)}
+    {@const looseX = $networkReleaseAnimation.looseX + ($networkReleaseAnimation.anchorX - $networkReleaseAnimation.looseX) * retract}
+    {@const looseY = $networkReleaseAnimation.looseY + ($networkReleaseAnimation.anchorY - $networkReleaseAnimation.looseY) * retract}
+    <svg class="network-draft-svg">
+      <path
+        d={curvedPath(
+          $networkReleaseAnimation.anchorX,
+          $networkReleaseAnimation.anchorY,
+          $networkReleaseAnimation.anchorPort,
+          looseX,
+          looseY,
+          $networkReleaseAnimation.loosePort,
+        )}
+        class="network-release-line"
+        style={`opacity: ${1 - releaseAnimationProgress};`}
+      />
+      <circle
+        cx={$networkReleaseAnimation.anchorX}
+        cy={$networkReleaseAnimation.anchorY}
+        r="4"
+        class="network-dot"
+        style={`opacity: ${1 - releaseAnimationProgress * 0.35};`}
+      />
+      <circle
+        cx={looseX}
+        cy={looseY}
+        r="4"
+        class="network-dot network-release-dot"
+        style={`opacity: ${1 - releaseAnimationProgress};`}
+      />
+    </svg>
+  {/if}
 
   <ContextMenu />
 
@@ -121,10 +298,10 @@
   .canvas-viewport {
     position: fixed;
     top: var(--toolbar-height);
-    left: var(--sidebar-width, 0px);
+    left: 0;
     right: 0;
-    bottom: calc(22px + var(--debug-height, 0px));
-    transition: left 0.15s;
+    bottom: 22px;
+    transition: left 0.15s, bottom 0.15s;
     overflow: hidden;
     background: var(--pcb-dark);
     cursor: crosshair;
@@ -156,6 +333,13 @@
     pointer-events: none;
   }
 
+  .network-svg {
+    position: absolute;
+    inset: 0;
+    overflow: visible;
+    pointer-events: none;
+  }
+
   .conn-line {
     fill: none;
     stroke: rgba(242, 176, 90, 0.58);
@@ -175,6 +359,43 @@
 
   .conn-dot-parent {
     fill: rgba(120, 229, 164, 0.95);
+  }
+
+  .network-line {
+    fill: none;
+    stroke: rgba(92, 200, 255, 0.78);
+    stroke-width: 2.5;
+    filter: drop-shadow(0 0 6px rgba(92, 200, 255, 0.28));
+  }
+
+  .network-dot {
+    fill: rgba(92, 200, 255, 0.96);
+  }
+
+  .network-draft-svg {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    overflow: visible;
+    z-index: 50;
+  }
+
+  .network-draft-line {
+    fill: none;
+    stroke: rgba(92, 200, 255, 0.88);
+    stroke-width: 2;
+    stroke-dasharray: 7 5;
+  }
+
+  .network-release-line {
+    fill: none;
+    stroke: rgba(92, 200, 255, 0.82);
+    stroke-width: 2.25;
+    filter: drop-shadow(0 0 8px rgba(92, 200, 255, 0.22));
+  }
+
+  .network-release-dot {
+    filter: drop-shadow(0 0 8px rgba(92, 200, 255, 0.3));
   }
 
   .origin-mark {

@@ -3,7 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::process::Output;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::{runtime, state::AppState, tmux};
+use crate::{
+    runtime,
+    state::{AppState, WindowParentSource},
+    tmux,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TmuxSnapshot {
@@ -24,6 +28,8 @@ pub struct TmuxSession {
     pub active: bool,
     pub window_ids: Vec<String>,
     pub active_window_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -39,6 +45,8 @@ pub struct TmuxWindow {
     pub pane_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_window_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_window_source: Option<WindowParentSource>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,6 +104,7 @@ fn parse_snapshot(
             active: false,
             window_ids: Vec::new(),
             active_window_id: None,
+            root_cwd: None,
         });
     }
 
@@ -160,6 +169,7 @@ fn parse_snapshot(
             rows: parts[7].parse().unwrap_or_default(),
             pane_ids: Vec::new(),
             parent_window_id: None,
+            parent_window_source: None,
         });
     }
 
@@ -234,6 +244,7 @@ fn parse_snapshot(
             active: false,
             window_ids: Vec::new(),
             active_window_id: None,
+            root_cwd: None,
         });
     }
 
@@ -382,7 +393,7 @@ pub fn normalize_multi_pane_windows(state: &AppState) -> Result<bool, String> {
         )?;
         let new_window_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !new_window_id.is_empty() {
-            state.set_window_parent(&new_window_id, Some(source_window_id.clone()));
+            state.set_window_parent_with_source(&new_window_id, Some(source_window_id.clone()), WindowParentSource::Hook);
         }
         if !new_window_id.is_empty() && !title.trim().is_empty() {
             let _ = rename_window(&new_window_id, &title);
@@ -403,6 +414,51 @@ fn existing_session_names() -> Result<Vec<String>, String> {
         .collect())
 }
 
+fn default_session_root_cwd() -> String {
+    runtime::project_root_dir()
+        .to_str()
+        .map(str::to_string)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+}
+
+pub fn set_session_root_cwd(target: &str, cwd: &str) -> Result<(), String> {
+    ensure_success(
+        run_tmux(&["set-environment", "-t", target, "HERD_TAB_ROOT_CWD", cwd])?,
+        "tmux set-environment HERD_TAB_ROOT_CWD failed",
+    )?;
+    Ok(())
+}
+
+pub fn set_session_env(target: &str, key: &str, value: &str) -> Result<(), String> {
+    ensure_success(
+        run_tmux(&["set-environment", "-t", target, key, value])?,
+        &format!("tmux set-environment {key} failed"),
+    )?;
+    Ok(())
+}
+
+pub fn session_root_cwd(target: &str) -> Result<Option<String>, String> {
+    let output = run_tmux(&["show-environment", "-t", target, "HERD_TAB_ROOT_CWD"])?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .strip_prefix("HERD_TAB_ROOT_CWD=")
+        .map(str::to_string);
+    Ok(value.filter(|value| !value.trim().is_empty()))
+}
+
+pub fn ensure_session_root_cwd(target: &str) -> Result<String, String> {
+    if let Some(existing) = session_root_cwd(target)? {
+        return Ok(existing);
+    }
+    let cwd = default_session_root_cwd();
+    set_session_root_cwd(target, &cwd)?;
+    Ok(cwd)
+}
+
 fn unique_session_name(base: Option<&str>) -> Result<String, String> {
     let base = base.filter(|value| !value.trim().is_empty()).unwrap_or("tab");
     let existing: BTreeSet<String> = existing_session_names()?.into_iter().collect();
@@ -420,6 +476,8 @@ fn unique_session_name(base: Option<&str>) -> Result<String, String> {
 
 pub fn ensure_default_session() -> Result<String, String> {
     if let Some(name) = first_session_name()? {
+        let _ = set_session_env(&name, "HERD_SOCK", runtime::socket_path());
+        let _ = ensure_session_root_cwd(&name);
         return Ok(name);
     }
     let herd_sock = format!("HERD_SOCK={}", runtime::socket_path());
@@ -440,6 +498,8 @@ pub fn ensure_default_session() -> Result<String, String> {
         ])?,
         "tmux new-session failed",
     )?;
+    let _ = set_session_env(runtime::session_name(), "HERD_SOCK", runtime::socket_path());
+    let _ = set_session_root_cwd(runtime::session_name(), &default_session_root_cwd());
     Ok(runtime::session_name().to_string())
 }
 
@@ -478,7 +538,10 @@ pub fn create_session(name: Option<&str>) -> Result<String, String> {
         ])?,
         "tmux new-session failed",
     )?;
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let session_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let _ = set_session_env(&session_id, "HERD_SOCK", runtime::socket_path());
+    let _ = set_session_root_cwd(&session_id, &default_session_root_cwd());
+    Ok(session_id)
 }
 
 pub fn create_window(target_pane: Option<&str>, command: Option<&str>) -> Result<String, String> {
@@ -672,8 +735,17 @@ pub fn snapshot(state: &AppState) -> Result<TmuxSnapshot, String> {
     });
 
     let window_parents = state.window_parents_snapshot();
+    let window_parent_sources = state.window_parent_sources_snapshot();
     for window in &mut snapshot.windows {
         window.parent_window_id = window_parents.get(&window.id).cloned();
+        window.parent_window_source = window_parent_sources.get(&window.id).copied();
+    }
+
+    for session in &mut snapshot.sessions {
+        session.root_cwd = session_root_cwd(&session.id)
+            .ok()
+            .flatten()
+            .or_else(|| Some(default_session_root_cwd()));
     }
 
     Ok(snapshot)
@@ -750,7 +822,7 @@ mod tests {
                 window_id: "@1".to_string(),
                 pane_id: "%1".to_string(),
                 active: false,
-                title: "Claude".to_string(),
+                title: "Agent".to_string(),
             },
             PaneNormalizationRow {
                 session_id: "$1".to_string(),
@@ -778,7 +850,7 @@ mod tests {
         assert_eq!(
             plan,
             vec![
-                ("$1".to_string(), "@1".to_string(), "%1".to_string(), "Claude".to_string()),
+                ("$1".to_string(), "@1".to_string(), "%1".to_string(), "Agent".to_string()),
                 ("$1".to_string(), "@1".to_string(), "%3".to_string(), "Agent B".to_string()),
             ]
         );

@@ -1,14 +1,96 @@
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 
+use crate::agent::{AgentChannelEvent, AgentDebugState, AgentInfo, AgentLogEntry, AgentRole, AgentStreamEnvelope, AgentType, ChatterEntry, TopicInfo};
+use crate::db::{self, PersistedTopicRecord};
+use crate::network;
 use crate::persist::{self, HerdState, TileState};
 use crate::tmux_control::{TmuxControl, TmuxWriter, OutputBuffers};
 
 type PendingTestDriverRequests = HashMap<String, Sender<Result<Value, String>>>;
+type AgentSubscribers = HashMap<u64, UnboundedSender<AgentStreamEnvelope>>;
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowParentSource {
+    Hook,
+    Manual,
+}
+
+#[derive(Clone)]
+struct WindowParentLink {
+    parent_window_id: String,
+    source: WindowParentSource,
+}
+
+#[derive(Clone)]
+struct AgentRecord {
+    agent_id: String,
+    agent_type: AgentType,
+    agent_role: AgentRole,
+    tile_id: String,
+    window_id: String,
+    session_id: String,
+    title: String,
+    display_name: String,
+    chatter_subscribed: bool,
+    topics: BTreeSet<String>,
+    alive: bool,
+    welcomed: bool,
+    registration_ts_ms: i64,
+    last_seen_ts_ms: i64,
+    last_ping_sent_at: Option<Instant>,
+    last_ping_ack_at: Option<Instant>,
+    ping_deadline: Option<Instant>,
+    agent_pid: Option<u32>,
+    subscribers: AgentSubscribers,
+}
+
+impl AgentRecord {
+    fn to_info(&self) -> AgentInfo {
+        AgentInfo {
+            agent_id: self.agent_id.clone(),
+            agent_type: self.agent_type,
+            agent_role: self.agent_role,
+            tile_id: self.tile_id.clone(),
+            window_id: self.window_id.clone(),
+            session_id: self.session_id.clone(),
+            title: self.title.clone(),
+            display_name: self.display_name.clone(),
+            alive: self.alive,
+            chatter_subscribed: self.chatter_subscribed,
+            topics: self.topics.iter().cloned().collect(),
+            agent_pid: self.agent_pid,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TopicRecord {
+    session_id: String,
+    name: String,
+    subscribers: BTreeSet<String>,
+    last_activity_at: Option<i64>,
+}
+
+pub struct AgentSubscriptionInit {
+    pub subscriber_id: u64,
+    pub signed_on: bool,
+    pub bootstrap: bool,
+    pub info: AgentInfo,
+}
+
+pub struct AgentPingCycle {
+    pub to_ping: Vec<(String, String)>,
+    pub expired: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -18,16 +100,35 @@ pub struct AppState {
     pub tile_states: Arc<Mutex<HerdState>>,
     pub snapshot_version: Arc<AtomicU64>,
     pub last_active_session: Arc<Mutex<Option<String>>>,
-    pub window_parents: Arc<Mutex<HashMap<String, String>>>,
+    window_parents: Arc<Mutex<HashMap<String, WindowParentLink>>>,
     pub test_driver_frontend_ready: Arc<AtomicBool>,
     pub test_driver_bootstrap_complete: Arc<AtomicBool>,
     pub pending_test_driver_requests: Arc<Mutex<PendingTestDriverRequests>>,
     pub test_driver_request_counter: Arc<AtomicU64>,
     pub claude_command_cache: Arc<Mutex<HashMap<String, crate::commands::ClaudeMenuData>>>,
+    agent_records: Arc<Mutex<HashMap<String, AgentRecord>>>,
+    topic_records: Arc<Mutex<HashMap<String, TopicRecord>>>,
+    chatter_entries: Arc<Mutex<Vec<ChatterEntry>>>,
+    agent_log_entries: Arc<Mutex<Vec<AgentLogEntry>>>,
+    agent_display_counter: Arc<AtomicU64>,
+    agent_subscriber_counter: Arc<AtomicU64>,
+    agent_ping_counter: Arc<AtomicU64>,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        if let Err(error) = db::reset_runtime_presence_state() {
+            log::warn!("Failed to reset runtime presence state in sqlite: {error}");
+        }
+        let persisted_agents = db::load_agents().unwrap_or_default();
+        let persisted_topics = db::load_topics().unwrap_or_default();
+        let chatter_entries = persist::load_chatter_entries();
+        let agent_log_entries = persist::load_agent_log_entries();
+        let agent_display_counter = persisted_agents
+            .iter()
+            .filter_map(|agent| parse_agent_display_index(&agent.display_name))
+            .max()
+            .unwrap_or(0);
         Self {
             tmux_control: Arc::new(Mutex::new(None)),
             tmux_writer: Arc::new(Mutex::new(None)),
@@ -41,6 +142,13 @@ impl AppState {
             pending_test_driver_requests: Arc::new(Mutex::new(HashMap::new())),
             test_driver_request_counter: Arc::new(AtomicU64::new(0)),
             claude_command_cache: Arc::new(Mutex::new(HashMap::new())),
+            agent_records: Arc::new(Mutex::new(build_agent_record_map(persisted_agents))),
+            topic_records: Arc::new(Mutex::new(build_topic_record_map(persisted_topics))),
+            chatter_entries: Arc::new(Mutex::new(chatter_entries)),
+            agent_log_entries: Arc::new(Mutex::new(agent_log_entries)),
+            agent_display_counter: Arc::new(AtomicU64::new(agent_display_counter)),
+            agent_subscriber_counter: Arc::new(AtomicU64::new(0)),
+            agent_ping_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -148,13 +256,28 @@ impl AppState {
     }
 
     pub fn set_window_parent(&self, child_window_id: &str, parent_window_id: Option<String>) {
+        self.set_window_parent_with_source(child_window_id, parent_window_id, WindowParentSource::Manual);
+    }
+
+    pub fn set_window_parent_with_source(
+        &self,
+        child_window_id: &str,
+        parent_window_id: Option<String>,
+        source: WindowParentSource,
+    ) {
         if let Ok(mut parents) = self.window_parents.lock() {
             let resolved_parent = parent_window_id
                 .and_then(|parent| resolve_root_parent_from_map(&parents, &parent).or(Some(parent)))
                 .filter(|parent| parent != child_window_id);
             match resolved_parent {
                 Some(parent_window_id) => {
-                    parents.insert(child_window_id.to_string(), parent_window_id);
+                    parents.insert(
+                        child_window_id.to_string(),
+                        WindowParentLink {
+                            parent_window_id,
+                            source,
+                        },
+                    );
                 }
                 None => {
                     parents.remove(child_window_id);
@@ -178,6 +301,18 @@ impl AppState {
             .unwrap_or_default()
     }
 
+    pub fn window_parent_sources_snapshot(&self) -> HashMap<String, WindowParentSource> {
+        self.window_parents
+            .lock()
+            .map(|parents| {
+                parents
+                    .iter()
+                    .map(|(child, link)| (child.clone(), link.source))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn resolve_root_window_parent(&self, window_id: &str) -> Option<String> {
         self.window_parents
             .lock()
@@ -190,7 +325,7 @@ impl AppState {
         F: FnMut(&str, &str) -> bool,
     {
         if let Ok(mut parents) = self.window_parents.lock() {
-            parents.retain(|child, parent| keep(child, parent));
+            parents.retain(|child, parent| keep(child, &parent.parent_window_id));
         }
     }
 
@@ -269,21 +404,554 @@ impl AppState {
             cache.insert(cwd, commands);
         }
     }
+
+    fn next_agent_display_name(&self) -> String {
+        let value = self.agent_display_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("Agent {value}")
+    }
+
+    fn next_agent_subscriber_id(&self) -> u64 {
+        self.agent_subscriber_counter.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn next_ping_id(&self) -> String {
+        let value = self.agent_ping_counter.fetch_add(1, Ordering::SeqCst) + 1;
+        format!("ping-{value}")
+    }
+
+    fn persist_agent_and_topic_state(&self) -> Result<(), String> {
+        let agents = self
+            .agent_records
+            .lock()
+            .map_err(|e| e.to_string())?
+            .values()
+            .map(AgentRecord::to_info)
+            .collect::<Vec<_>>();
+        let topics = self
+            .topic_records
+            .lock()
+            .map_err(|e| e.to_string())?
+            .values()
+            .map(|record| PersistedTopicRecord {
+                session_id: record.session_id.clone(),
+                name: record.name.clone(),
+                subscribers: record.subscribers.iter().cloned().collect(),
+                last_activity_at: record.last_activity_at,
+            })
+            .collect::<Vec<_>>();
+        db::replace_agents(&agents)?;
+        db::replace_topics(&topics)?;
+        Ok(())
+    }
+
+    pub fn upsert_agent(
+        &self,
+        agent_id: String,
+        tile_id: String,
+        window_id: String,
+        session_id: String,
+        title: String,
+        agent_type: AgentType,
+        agent_role: AgentRole,
+        agent_pid: Option<u32>,
+    ) -> Result<AgentInfo, String> {
+        let now_ms = crate::agent::now_ms();
+        let mut agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        let record = agents.entry(agent_id.clone()).or_insert_with(|| AgentRecord {
+            agent_id: agent_id.clone(),
+            agent_type,
+            agent_role,
+            tile_id: tile_id.clone(),
+            window_id: window_id.clone(),
+            session_id: session_id.clone(),
+            title: title.clone(),
+            display_name: if agent_role == AgentRole::Root {
+                "Root".to_string()
+            } else {
+                self.next_agent_display_name()
+            },
+            chatter_subscribed: true,
+            topics: BTreeSet::new(),
+            alive: false,
+            welcomed: false,
+            registration_ts_ms: now_ms,
+            last_seen_ts_ms: now_ms,
+            last_ping_sent_at: None,
+            last_ping_ack_at: None,
+            ping_deadline: None,
+            agent_pid,
+            subscribers: HashMap::new(),
+        });
+        record.tile_id = tile_id;
+        record.window_id = window_id;
+        record.session_id = session_id;
+        record.title = title;
+        record.agent_type = agent_type;
+        record.agent_role = agent_role;
+        if record.agent_role == AgentRole::Root {
+            record.display_name = "Root".to_string();
+        }
+        record.last_seen_ts_ms = now_ms;
+        if agent_pid.is_some() {
+            record.agent_pid = agent_pid;
+        }
+        let info = record.to_info();
+        drop(agents);
+        self.persist_agent_and_topic_state()?;
+        Ok(info)
+    }
+
+    pub fn unregister_agent(&self, agent_id: &str) -> Result<Option<AgentInfo>, String> {
+        let mut agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        let removed = agents.remove(agent_id).map(|record| record.to_info());
+        drop(agents);
+        self.persist_agent_and_topic_state()?;
+        Ok(removed)
+    }
+
+    pub fn agent_info(&self, agent_id: &str) -> Result<Option<AgentInfo>, String> {
+        let agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        Ok(agents.get(agent_id).map(AgentRecord::to_info))
+    }
+
+    pub fn root_agent_in_session(&self, session_id: &str) -> Result<Option<AgentInfo>, String> {
+        let agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        Ok(agents
+            .values()
+            .find(|record| record.session_id == session_id && record.agent_role == AgentRole::Root)
+            .map(AgentRecord::to_info))
+    }
+
+    pub fn agent_info_by_tile(&self, tile_id: &str) -> Result<Option<AgentInfo>, String> {
+        let agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        Ok(agents
+            .values()
+            .find(|record| record.tile_id == tile_id)
+            .map(AgentRecord::to_info))
+    }
+
+    pub fn list_agents_in_session(&self, session_id: &str) -> Result<Vec<AgentInfo>, String> {
+        let agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        let mut list = agents
+            .values()
+            .filter(|record| record.session_id == session_id)
+            .map(AgentRecord::to_info)
+            .collect::<Vec<_>>();
+        list.sort_by(|left, right| left.display_name.cmp(&right.display_name));
+        Ok(list)
+    }
+
+    pub fn list_topics_in_session(&self, session_id: &str) -> Result<Vec<TopicInfo>, String> {
+        let topics = self.topic_records.lock().map_err(|e| e.to_string())?;
+        let mut list = topics
+            .values()
+            .filter(|record| record.session_id == session_id)
+            .map(|record| TopicInfo {
+                session_id: record.session_id.clone(),
+                name: record.name.clone(),
+                subscriber_count: record.subscribers.len(),
+                last_activity_at: record.last_activity_at,
+            })
+            .collect::<Vec<_>>();
+        list.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(list)
+    }
+
+    pub fn chatter_entries(&self) -> Result<Vec<ChatterEntry>, String> {
+        self.chatter_entries
+            .lock()
+            .map(|entries| entries.clone())
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn chatter_entries_in_session(&self, session_id: &str) -> Result<Vec<ChatterEntry>, String> {
+        let entries = self.chatter_entries.lock().map_err(|e| e.to_string())?;
+        Ok(entries
+            .iter()
+            .filter(|entry| entry.session_id == session_id)
+            .cloned()
+            .collect())
+    }
+
+    pub fn agent_log_entries_in_session(&self, session_id: &str) -> Result<Vec<AgentLogEntry>, String> {
+        let entries = self.agent_log_entries.lock().map_err(|e| e.to_string())?;
+        Ok(entries
+            .iter()
+            .filter(|entry| entry.session_id == session_id)
+            .cloned()
+            .collect())
+    }
+
+    pub fn public_chatter_since_in_session(
+        &self,
+        session_id: &str,
+        cutoff_ms: i64,
+    ) -> Result<Vec<ChatterEntry>, String> {
+        let entries = self.chatter_entries.lock().map_err(|e| e.to_string())?;
+        Ok(entries
+            .iter()
+            .filter(|entry| entry.session_id == session_id && entry.public && entry.timestamp_ms >= cutoff_ms)
+            .cloned()
+            .collect())
+    }
+
+    pub fn append_chatter_entry(&self, entry: ChatterEntry) -> Result<(), String> {
+        persist::append_chatter_entry(&entry)?;
+        self.chatter_entries
+            .lock()
+            .map_err(|e| e.to_string())?
+            .push(entry);
+        Ok(())
+    }
+
+    pub fn append_agent_log_entry(&self, entry: AgentLogEntry) -> Result<(), String> {
+        persist::append_agent_log_entry(&entry)?;
+        self.agent_log_entries
+            .lock()
+            .map_err(|e| e.to_string())?
+            .push(entry);
+        Ok(())
+    }
+
+    pub fn snapshot_agent_debug_state_for_session(&self, session_id: &str) -> Result<AgentDebugState, String> {
+        Ok(AgentDebugState {
+            agents: self.list_agents_in_session(session_id)?,
+            topics: self.list_topics_in_session(session_id)?,
+            chatter: self.chatter_entries_in_session(session_id)?,
+            agent_logs: self.agent_log_entries_in_session(session_id)?,
+            connections: network::list_connections_at(std::path::Path::new(crate::runtime::database_path()), session_id)?,
+        })
+    }
+
+    pub fn subscribe_agent_events(
+        &self,
+        agent_id: &str,
+        sender: UnboundedSender<AgentStreamEnvelope>,
+    ) -> Result<AgentSubscriptionInit, String> {
+        let subscriber_id = self.next_agent_subscriber_id();
+        let now_ms = crate::agent::now_ms();
+        let now = Instant::now();
+        let mut agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        let record = agents
+            .get_mut(agent_id)
+            .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        record.subscribers.insert(subscriber_id, sender);
+        record.last_seen_ts_ms = now_ms;
+        record.last_ping_ack_at = Some(now);
+        record.ping_deadline = None;
+        let signed_on = !record.alive;
+        record.alive = true;
+        let bootstrap = !record.welcomed;
+        if bootstrap {
+            record.welcomed = true;
+        }
+        let init = AgentSubscriptionInit {
+            subscriber_id,
+            signed_on,
+            bootstrap,
+            info: record.to_info(),
+        };
+        drop(agents);
+        self.persist_agent_and_topic_state()?;
+        Ok(init)
+    }
+
+    pub fn unsubscribe_agent_events(&self, agent_id: &str, subscriber_id: u64) -> Result<Option<AgentInfo>, String> {
+        let mut agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        let Some(record) = agents.get_mut(agent_id) else {
+            return Ok(None);
+        };
+        record.subscribers.remove(&subscriber_id);
+        if !record.alive || !record.subscribers.is_empty() {
+            return Ok(None);
+        }
+        record.alive = false;
+        record.ping_deadline = None;
+        record.subscribers.clear();
+        let info = record.to_info();
+        drop(agents);
+        self.persist_agent_and_topic_state()?;
+        Ok(Some(info))
+    }
+
+    pub fn send_event_to_agent(
+        &self,
+        agent_id: &str,
+        event: AgentChannelEvent,
+    ) -> Result<(), String> {
+        let mut agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        let record = agents
+            .get_mut(agent_id)
+            .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        let envelope = AgentStreamEnvelope::Event { event };
+        record
+            .subscribers
+            .retain(|_, sender| sender.send(envelope.clone()).is_ok());
+        if record.subscribers.is_empty() {
+            return Err(format!("agent {agent_id} has no live subscribers"));
+        }
+        record.last_seen_ts_ms = crate::agent::now_ms();
+        Ok(())
+    }
+
+    pub fn broadcast_event_in_session(
+        &self,
+        session_id: &str,
+        event: AgentChannelEvent,
+        include_dead: bool,
+    ) -> Result<Vec<String>, String> {
+        let mut failed = Vec::new();
+        let mut agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        for record in agents.values_mut() {
+            if record.session_id != session_id {
+                continue;
+            }
+            if !include_dead && !record.alive {
+                continue;
+            }
+            let envelope = AgentStreamEnvelope::Event {
+                event: event.clone(),
+            };
+            record
+                .subscribers
+                .retain(|_, sender| sender.send(envelope.clone()).is_ok());
+            if record.subscribers.is_empty() && record.alive {
+                failed.push(record.agent_id.clone());
+            }
+        }
+        Ok(failed)
+    }
+
+    pub fn ack_agent_ping(&self, agent_id: &str) -> Result<AgentInfo, String> {
+        let now_ms = crate::agent::now_ms();
+        let now = Instant::now();
+        let mut agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        let record = agents
+            .get_mut(agent_id)
+            .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        record.alive = true;
+        record.last_seen_ts_ms = now_ms;
+        record.last_ping_ack_at = Some(now);
+        record.ping_deadline = None;
+        let info = record.to_info();
+        drop(agents);
+        self.persist_agent_and_topic_state()?;
+        Ok(info)
+    }
+
+    pub fn prepare_agent_ping_cycle(
+        &self,
+        interval: Duration,
+        timeout: Duration,
+    ) -> Result<AgentPingCycle, String> {
+        let now = Instant::now();
+        let mut agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        let mut expired = Vec::new();
+        let mut to_ping = Vec::new();
+        for record in agents.values_mut() {
+            if !record.alive {
+                continue;
+            }
+            if let Some(deadline) = record.ping_deadline {
+                if now >= deadline {
+                    expired.push(record.agent_id.clone());
+                    continue;
+                }
+                continue;
+            }
+            let due = record
+                .last_ping_sent_at
+                .map(|sent| now.duration_since(sent) >= interval)
+                .unwrap_or(true);
+            if due {
+                let ping_id = self.next_ping_id();
+                record.last_ping_sent_at = Some(now);
+                record.ping_deadline = Some(now + timeout);
+                to_ping.push((record.agent_id.clone(), ping_id));
+            }
+        }
+        Ok(AgentPingCycle { to_ping, expired })
+    }
+
+    pub fn mark_agent_dead(&self, agent_id: &str) -> Result<Option<AgentInfo>, String> {
+        let mut agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        let Some(record) = agents.get_mut(agent_id) else {
+            return Ok(None);
+        };
+        if !record.alive {
+            return Ok(None);
+        }
+        record.alive = false;
+        record.ping_deadline = None;
+        record.subscribers.clear();
+        let info = record.to_info();
+        drop(agents);
+        self.persist_agent_and_topic_state()?;
+        Ok(Some(info))
+    }
+
+    pub fn topic_subscribe(&self, agent_id: &str, topic: &str) -> Result<TopicInfo, String> {
+        let mut agents = self.agent_records.lock().map_err(|e| e.to_string())?;
+        let record = agents
+            .get_mut(agent_id)
+            .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        let session_id = record.session_id.clone();
+        record.topics.insert(topic.to_string());
+        drop(agents);
+
+        let mut topics = self.topic_records.lock().map_err(|e| e.to_string())?;
+        let topic_record = topics
+            .entry(topic_key(&session_id, topic))
+            .or_insert_with(|| TopicRecord {
+            session_id: session_id.clone(),
+            name: topic.to_string(),
+            subscribers: BTreeSet::new(),
+            last_activity_at: None,
+        });
+        topic_record.subscribers.insert(agent_id.to_string());
+        let info = TopicInfo {
+            session_id: topic_record.session_id.clone(),
+            name: topic_record.name.clone(),
+            subscriber_count: topic_record.subscribers.len(),
+            last_activity_at: topic_record.last_activity_at,
+        };
+        drop(topics);
+        self.persist_agent_and_topic_state()?;
+        Ok(info)
+    }
+
+    pub fn topic_unsubscribe(&self, agent_id: &str, topic: &str) -> Result<TopicInfo, String> {
+        let session_id = if let Ok(mut agents) = self.agent_records.lock() {
+            if let Some(record) = agents.get_mut(agent_id) {
+                record.topics.remove(topic);
+                record.session_id.clone()
+            } else {
+                return Err(format!("unknown agent: {agent_id}"));
+            }
+        } else {
+            return Err("failed to acquire agent registry lock".to_string());
+        };
+
+        let mut topics = self.topic_records.lock().map_err(|e| e.to_string())?;
+        let topic_record = topics
+            .entry(topic_key(&session_id, topic))
+            .or_insert_with(|| TopicRecord {
+            session_id: session_id.clone(),
+            name: topic.to_string(),
+            subscribers: BTreeSet::new(),
+            last_activity_at: None,
+        });
+        topic_record.subscribers.remove(agent_id);
+        let info = TopicInfo {
+            session_id: topic_record.session_id.clone(),
+            name: topic_record.name.clone(),
+            subscriber_count: topic_record.subscribers.len(),
+            last_activity_at: topic_record.last_activity_at,
+        };
+        drop(topics);
+        self.persist_agent_and_topic_state()?;
+        Ok(info)
+    }
+
+    pub fn touch_topics_in_session(&self, session_id: &str, topics_to_touch: &[String]) -> Result<(), String> {
+        let now = crate::agent::now_ms();
+        let mut topics = self.topic_records.lock().map_err(|e| e.to_string())?;
+        for topic in topics_to_touch {
+            let record = topics
+                .entry(topic_key(session_id, topic))
+                .or_insert_with(|| TopicRecord {
+                session_id: session_id.to_string(),
+                name: topic.clone(),
+                subscribers: BTreeSet::new(),
+                last_activity_at: None,
+            });
+            record.last_activity_at = Some(now);
+        }
+        drop(topics);
+        self.persist_agent_and_topic_state()?;
+        Ok(())
+    }
+
+    pub fn resolve_display_name(&self, agent_id: Option<&str>, fallback: &str) -> String {
+        if let Some(agent_id) = agent_id {
+            if let Ok(agents) = self.agent_records.lock() {
+                if let Some(record) = agents.get(agent_id) {
+                    return record.display_name.clone();
+                }
+            }
+        }
+        fallback.to_string()
+    }
+}
+
+fn build_agent_record_map(agents: Vec<AgentInfo>) -> HashMap<String, AgentRecord> {
+    agents
+        .into_iter()
+        .map(|agent| {
+            let record = AgentRecord {
+                agent_id: agent.agent_id.clone(),
+                agent_type: agent.agent_type,
+                agent_role: agent.agent_role,
+                tile_id: agent.tile_id.clone(),
+                window_id: agent.window_id.clone(),
+                session_id: agent.session_id.clone(),
+                title: agent.title.clone(),
+                display_name: agent.display_name.clone(),
+                chatter_subscribed: agent.chatter_subscribed,
+                topics: agent.topics.iter().cloned().collect(),
+                alive: agent.alive,
+                welcomed: true,
+                registration_ts_ms: 0,
+                last_seen_ts_ms: 0,
+                last_ping_sent_at: None,
+                last_ping_ack_at: None,
+                ping_deadline: None,
+                agent_pid: agent.agent_pid,
+                subscribers: HashMap::new(),
+            };
+            (record.agent_id.clone(), record)
+        })
+        .collect()
+}
+
+fn build_topic_record_map(topics: Vec<PersistedTopicRecord>) -> HashMap<String, TopicRecord> {
+    topics
+        .into_iter()
+        .map(|topic| {
+            let record = TopicRecord {
+                session_id: topic.session_id.clone(),
+                name: topic.name.clone(),
+                subscribers: topic.subscribers.into_iter().collect(),
+                last_activity_at: topic.last_activity_at,
+            };
+            (topic_key(&record.session_id, &record.name), record)
+        })
+        .collect()
+}
+
+fn topic_key(session_id: &str, topic: &str) -> String {
+    format!("{session_id}::{topic}")
+}
+
+fn parse_agent_display_index(display_name: &str) -> Option<u64> {
+    display_name
+        .strip_prefix("Agent ")
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 fn resolve_root_parent_from_map(
-    parents: &HashMap<String, String>,
+    parents: &HashMap<String, WindowParentLink>,
     window_id: &str,
 ) -> Option<String> {
-    let mut current = parents.get(window_id)?.clone();
+    let mut current = parents.get(window_id)?.parent_window_id.clone();
     let mut seen = std::collections::HashSet::from([window_id.to_string()]);
 
     loop {
       if !seen.insert(current.clone()) {
           return None;
       }
-      match parents.get(&current).cloned() {
-          Some(next) => current = next,
+      match parents.get(&current) {
+          Some(next) => current = next.parent_window_id.clone(),
           None => return Some(current),
       }
     }

@@ -30,6 +30,11 @@ emit('TOOL_USE_ID', d.get('tool_use_id') or d.get('toolUseID') or d.get('toolUse
 " 2>/dev/null)" || { echo '{"continue": true}'; exit 0; }
 
 HOOKS_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${HOOKS_DIR}/../.." && pwd)"
+TMUX_SERVER_NAME="herd"
+if [ -n "${HERD_RUNTIME_ID:-}" ]; then
+  TMUX_SERVER_NAME="herd-${HERD_RUNTIME_ID}"
+fi
 PARENT_PANE_ID="${TMUX_PANE:-}"
 if [ -z "$PARENT_PANE_ID" ] && [[ "$SESSION_ID" == %* ]]; then
   PARENT_PANE_ID="$SESSION_ID"
@@ -66,7 +71,7 @@ spawn_tile() {
 import json, sys
 x, y, parent = sys.argv[1], sys.argv[2], sys.argv[3]
 print(json.dumps({
-    "command": "spawn_shell",
+    "command": "shell_spawn",
     "x": float(x),
     "y": float(y),
     "width": 640,
@@ -79,7 +84,7 @@ print(json.dumps({
 import json, sys
 x, y = sys.argv[1], sys.argv[2]
 print(json.dumps({
-    "command": "spawn_shell",
+    "command": "shell_spawn",
     "x": float(x),
     "y": float(y),
     "width": 640,
@@ -95,7 +100,7 @@ set_tile_title() {
   socket_request "$(python3 -c '
 import json, sys
 sid, title = sys.argv[1], sys.argv[2]
-print(json.dumps({"command": "set_title", "session_id": sid, "title": title}))
+print(json.dumps({"command": "shell_title_set", "session_id": sid, "title": title}))
 ' "$sid" "$title" 2>/dev/null)" >/dev/null 2>&1
 }
 
@@ -105,8 +110,13 @@ set_tile_role() {
   socket_request "$(python3 -c '
 import json, sys
 sid, role = sys.argv[1], sys.argv[2]
-print(json.dumps({"command": "set_tile_role", "session_id": sid, "role": role}))
+print(json.dumps({"command": "shell_role_set", "session_id": sid, "role": role}))
 ' "$sid" "$role" 2>/dev/null)" >/dev/null 2>&1
+}
+
+role_claude_md() {
+  local role="${1:-worker}"
+  printf '%s\n' "$REPO_ROOT/.claude/roles/$role/CLAUDE.md"
 }
 
 send_tile_input() {
@@ -115,7 +125,7 @@ send_tile_input() {
   socket_request "$(python3 -c '
 import json, sys
 sid, command_input = sys.argv[1], sys.argv[2]
-print(json.dumps({"command": "send_input", "session_id": sid, "input": command_input}))
+print(json.dumps({"command": "shell_input_send", "session_id": sid, "input": command_input}))
 ' "$sid" "$command_input" 2>/dev/null)" >/dev/null 2>&1
 }
 
@@ -125,8 +135,29 @@ exec_tile_command() {
   socket_request "$(python3 -c '
 import json, sys
 sid, command_input = sys.argv[1], sys.argv[2]
-print(json.dumps({"command": "exec_in_shell", "session_id": sid, "shell_command": command_input}))
+print(json.dumps({"command": "shell_exec", "session_id": sid, "shell_command": command_input}))
 ' "$sid" "$command_input" 2>/dev/null)" >/dev/null 2>&1
+}
+
+wait_for_tile_output() {
+  local sid="$1"
+  local needle="$2"
+  local timeout_secs="${3:-10}"
+  local deadline
+  local pane_text
+
+  deadline=$(( $(date +%s) + timeout_secs ))
+  while [ "$(date +%s)" -le "$deadline" ]; do
+    pane_text="$(tmux capture-pane -p -t "$sid" 2>/dev/null || true)"
+    case "$pane_text" in
+      *"$needle"*)
+        return 0
+        ;;
+    esac
+    sleep 0.1
+  done
+
+  return 1
 }
 
 start_agent_task_watcher() {
@@ -241,7 +272,7 @@ generic_team_name() {
 
 launch_team_agent_tile() {
   local sid title claude_bin agent_id agent_color launch_command
-  local permission_flags model_flags test_marker
+  local permission_flags model_flags test_marker prompt_file
 
   sid="$1"
   title="${AGENT_NAME}@${TEAM_NAME}"
@@ -249,6 +280,7 @@ launch_team_agent_tile() {
 
   claude_bin="$(resolve_claude_bin)"
   [ -z "$claude_bin" ] && return
+  prompt_file="$(role_claude_md worker)"
 
   agent_id="${AGENT_NAME}@${TEAM_NAME}"
   agent_color="$(resolve_agent_color)"
@@ -274,17 +306,34 @@ launch_team_agent_tile() {
   launch_command="$(python3 -c '
 import shlex, sys
 
-cwd = sys.argv[1]
-test_marker = sys.argv[2]
-argv = sys.argv[3:]
+test_marker = sys.argv[1]
+herd_agent_id = sys.argv[2]
+herd_pane_id = sys.argv[3]
+herd_session_id = sys.argv[4]
+tmux_server_name = sys.argv[5]
+prompt_file = sys.argv[6]
+argv = sys.argv[7:]
 parts = []
-if cwd:
-    parts.append(f"cd {shlex.quote(cwd)}")
 if test_marker:
     parts.append(f"printf '\''%s\\n'\'' {shlex.quote(test_marker)}")
-parts.append("exec " + " ".join(shlex.quote(arg) for arg in argv))
-print(" && ".join(parts) + "\n")
-' "$CWD" "$test_marker" "$claude_bin" \
+parts.append(
+    f"(sleep 1; tmux -f /dev/null -L {shlex.quote(tmux_server_name)} "
+    + f"send-keys -t {shlex.quote(herd_pane_id)} Enter >/dev/null 2>&1) &"
+)
+parts.append(
+    "export "
+    + f"HERD_AGENT_ID={shlex.quote(herd_agent_id)} "
+    + f"HERD_PANE_ID={shlex.quote(herd_pane_id)} "
+    + f"HERD_SESSION_ID={shlex.quote(herd_session_id)}"
+)
+parts.append(f"HERD_ROLE_CLAUDE_MD={shlex.quote(prompt_file)}")
+parts.append("[ -f \"$HERD_ROLE_CLAUDE_MD\" ] || { echo \"Missing role prompt file: $HERD_ROLE_CLAUDE_MD\"; exit 1; }")
+parts.append("exec " + " ".join(shlex.quote(arg) for arg in argv) + " --append-system-prompt \"$(cat \"$HERD_ROLE_CLAUDE_MD\")\"")
+print("\n".join(parts) + "\n")
+' "$test_marker" "$agent_id" "$sid" "$SESSION_ID" "$TMUX_SERVER_NAME" "$prompt_file" "$claude_bin" \
+    --mcp-config "$REPO_ROOT/.mcp.json" \
+    --teammate-mode tmux \
+    --dangerously-load-development-channels server:herd \
     --agent-id "$agent_id" \
     --agent-name "$AGENT_NAME" \
     --team-name "$TEAM_NAME" \
@@ -298,8 +347,8 @@ print(" && ".join(parts) + "\n")
 
 launch_generic_agent_tile() {
   local sid title generic_label claude_bin agent_name team_name agent_color parent_session_id launch_command attach_command
-  local permission_flags model_flags test_marker
-  local q_cwd q_test_marker q_resolve q_stream_output q_transcript q_tool_use_id q_claude_bin arg
+  local permission_flags model_flags test_marker prompt_file
+  local q_cwd q_test_marker q_resolve q_stream_output q_transcript q_tool_use_id q_claude_bin q_mcp_config q_tmux_server q_prompt_file arg
 
   sid="$1"
   generic_label="${AGENT_DESC:-${AGENT_PROMPT:-Agent}}"
@@ -308,6 +357,7 @@ launch_generic_agent_tile() {
 
   claude_bin="$(resolve_claude_bin)"
   [ -z "$claude_bin" ] && return
+  prompt_file="$(role_claude_md worker)"
 
   parent_session_id="$(resolve_parent_session_id)"
   [ -z "$parent_session_id" ] && return
@@ -335,26 +385,39 @@ launch_generic_agent_tile() {
     test_marker="__HERD_AGENT_LAUNCH__ generic ${agent_name} ${team_name} ${agent_color} ${parent_session_id} ${TOOL_USE_ID} ${PERMISSION_MODE:-default} ${MODEL:-default}"
   fi
 
-  q_cwd="$(shell_quote "$CWD")"
   q_resolve="$(shell_quote "${HOOKS_DIR}/resolve-agent-launch.py")"
   q_stream_output="$(shell_quote "${HOOKS_DIR}/stream-agent-output.py")"
   q_transcript="$(shell_quote "$TRANSCRIPT")"
   q_tool_use_id="$(shell_quote "$TOOL_USE_ID")"
   q_claude_bin="$(shell_quote "$claude_bin")"
+  q_prompt_file="$(shell_quote "$prompt_file")"
+  q_mcp_config="$(shell_quote "$REPO_ROOT/.mcp.json")"
+  q_tmux_server="$(shell_quote "$TMUX_SERVER_NAME")"
 
-  launch_command="cd ${q_cwd} || exit 1"
+  launch_command=""
   if [ "$RUN_IN_BACKGROUND" = "yes" ]; then
-    launch_command="${launch_command}; printf '%s\\n' 'Waiting for agent output file...'"
-    launch_command="${launch_command}; OUTPUT_FILE=\"\$(python3 ${q_resolve} ${q_transcript} ${q_tool_use_id} output_file)\" || exit 1"
-    launch_command="${launch_command}; [ -n \"\$OUTPUT_FILE\" ] || { echo 'Failed to resolve agent output file'; exit 1; }"
+    if [ -n "$CWD" ]; then
+      q_cwd="$(shell_quote "$CWD")"
+      launch_command="cd ${q_cwd} || exit 1"
+    fi
+    [ -n "$launch_command" ] && launch_command="${launch_command}
+"
+    launch_command="${launch_command}printf '%s\\n' 'Waiting for agent output file...'"
+    launch_command="${launch_command}
+OUTPUT_FILE=\"\$(python3 ${q_resolve} ${q_transcript} ${q_tool_use_id} output_file)\" || exit 1"
+    launch_command="${launch_command}
+[ -n \"\$OUTPUT_FILE\" ] || { echo 'Failed to resolve agent output file'; exit 1; }"
     if [ -n "$test_marker" ]; then
       q_test_marker="$(shell_quote "$test_marker")"
-      launch_command="${launch_command}; printf '%s\\n' ${q_test_marker} \"\$OUTPUT_FILE\""
+      launch_command="${launch_command}
+printf '%s\\n' ${q_test_marker} \"\$OUTPUT_FILE\""
     fi
-    launch_command="${launch_command}; printf '%s %s\\n' 'Following agent output:' \"\$OUTPUT_FILE\""
-    launch_command="${launch_command}; exec python3 ${q_stream_output} \"\$OUTPUT_FILE\""
+    launch_command="${launch_command}
+printf '%s %s\\n' 'Following agent output:' \"\$OUTPUT_FILE\""
+    launch_command="${launch_command}
+exec python3 ${q_stream_output} \"\$OUTPUT_FILE\""
   else
-    attach_command="${q_claude_bin} --agent-id \"\$AGENT_ID\""
+    attach_command="${q_claude_bin} --append-system-prompt \"\$(cat \"\$HERD_ROLE_CLAUDE_MD\")\" --mcp-config ${q_mcp_config} --teammate-mode tmux --dangerously-load-development-channels server:herd --agent-id \"\$AGENT_ID\""
     for arg in \
       --agent-name "$agent_name" \
       --team-name "$team_name" \
@@ -365,20 +428,52 @@ launch_generic_agent_tile() {
       attach_command="${attach_command} $(shell_quote "$arg")"
     done
 
-    launch_command="${launch_command}; printf '%s\\n' 'Waiting for agent session id...'"
-    launch_command="${launch_command}; AGENT_ID=\"\$(python3 ${q_resolve} ${q_transcript} ${q_tool_use_id} agent_id)\" || exit 1"
-    launch_command="${launch_command}; [ -n \"\$AGENT_ID\" ] || { echo 'Failed to resolve agent id'; exit 1; }"
+    [ -n "$launch_command" ] && launch_command="${launch_command}
+"
+    launch_command="${launch_command}printf '%s\\n' 'Waiting for agent session id...'"
+    launch_command="${launch_command}
+AGENT_ID=\"\$(python3 ${q_resolve} ${q_transcript} ${q_tool_use_id} agent_id)\" || exit 1"
+    launch_command="${launch_command}
+[ -n \"\$AGENT_ID\" ] || { echo 'Failed to resolve agent id'; exit 1; }"
     if [ -n "$test_marker" ]; then
       q_test_marker="$(shell_quote "$test_marker")"
-      launch_command="${launch_command}; printf '%s\\n' ${q_test_marker} \"\$AGENT_ID\""
+      launch_command="${launch_command}
+printf '%s\\n' ${q_test_marker} \"\$AGENT_ID\""
     fi
-    launch_command="${launch_command}; ATTACH_RETRY_COUNT=0"
-    launch_command="${launch_command}; while true; do ATTACH_START=\$(date +%s); ${attach_command}; ATTACH_STATUS=\$?; ATTACH_END=\$(date +%s); ATTACH_DURATION=\$((ATTACH_END - ATTACH_START)); if [ \"\$ATTACH_DURATION\" -ge 2 ]; then exit \"\$ATTACH_STATUS\"; fi; ATTACH_RETRY_COUNT=\$((ATTACH_RETRY_COUNT + 1)); if [ \"\$ATTACH_RETRY_COUNT\" -ge 30 ]; then echo 'Failed to attach to agent session after retries.'; exit \"\$ATTACH_STATUS\"; fi; echo 'Retrying agent attach...'; sleep 1; done"
+    launch_command="${launch_command}
+(sleep 1; tmux -f /dev/null -L ${q_tmux_server} send-keys -t $(shell_quote "$sid") Enter >/dev/null 2>&1) &"
+    launch_command="${launch_command}
+export HERD_AGENT_ID=\"\$AGENT_ID\"
+export HERD_PANE_ID=$(shell_quote "$sid")
+export HERD_SESSION_ID=$(shell_quote "$parent_session_id")
+export HERD_ROLE_CLAUDE_MD=${q_prompt_file}
+[ -f \"\$HERD_ROLE_CLAUDE_MD\" ] || { echo 'Missing role prompt file'; exit 1; }
+ATTACH_RETRY_COUNT=0
+while true; do
+  ATTACH_START=\$(date +%s)
+  ${attach_command}
+  ATTACH_STATUS=\$?
+  ATTACH_END=\$(date +%s)
+  ATTACH_DURATION=\$((ATTACH_END - ATTACH_START))
+  if [ \"\$ATTACH_DURATION\" -ge 2 ]; then
+    exit \"\$ATTACH_STATUS\"
+  fi
+  ATTACH_RETRY_COUNT=\$((ATTACH_RETRY_COUNT + 1))
+  if [ \"\$ATTACH_RETRY_COUNT\" -ge 30 ]; then
+    echo 'Failed to attach to agent session after retries.'
+    exit \"\$ATTACH_STATUS\"
+  fi
+  echo 'Retrying agent attach...'
+  sleep 1
+done"
   fi
 
   if [ -n "$launch_command" ]; then
     start_agent_task_watcher "$sid"
     exec_tile_command "$sid" "$launch_command"
+    if [ -n "${HERD_CLAUDE_AGENT_BIN:-}" ] && [ "$RUN_IN_BACKGROUND" != "yes" ]; then
+      wait_for_tile_output "$sid" "__HERD_AGENT_LAUNCH__ generic" 10 >/dev/null 2>&1 || true
+    fi
   fi
 }
 

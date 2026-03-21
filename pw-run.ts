@@ -37,7 +37,7 @@ async function run(page: Page, line: string): Promise<string> {
   } else if (line === 'debug') {
     return await page.$eval('#herd-debug', (el: any) => el.textContent).catch(() => '(none)');
   } else if (line === 'shells') {
-    const resp = await sockCmd({ command: 'list_shells' });
+    const resp = await sockCmd({ command: 'shell_list' });
     return resp.data.map((s: any) => `${s.pane_id} sid=${s.id.slice(0, 8)}`).join('\n');
   } else if (line === 'screenshot') {
     await page.screenshot({ path: '/tmp/herd-pw.png' });

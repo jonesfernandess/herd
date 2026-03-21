@@ -8,7 +8,7 @@ Herd is primarily keyboard-driven. This page tracks the current shortcut surface
 - `Shift+Esc`: leave input mode and return to command mode
 - `:`: open the command bar
 - `?`: open help; any key or click closes it
-- `b`: toggle the tmux tree sidebar
+- `b`: toggle the `TREE` sidebar
 - `d`: toggle the debug pane
 
 ## Navigation
@@ -33,7 +33,7 @@ Herd is primarily keyboard-driven. This page tracks the current shortcut surface
 - `0`: reset canvas zoom and pan
 - `a`: cycle anchored arrangements for the active tab (`circle`, `snowflake`, `stack-down`, `stack-right`, `spiral`) and fit the view
 
-## Shells And Tabs
+## Tiles And Tabs
 
 - `s`: spawn a new shell
 - `x`: close the selected shell
@@ -42,12 +42,20 @@ Herd is primarily keyboard-driven. This page tracks the current shortcut surface
 
 ## Sidebar
 
-- `j / k`: move the tree selection
+- `Shift+j / Shift+k`: focus the next / previous sidebar section
+- `j / k`: move within the focused sidebar section
 - `r`: prefill a rename command for the selected item
 - `i`: enter input mode for the selected shell
 - `z`: zoom to the selected shell
 - `Z`: fullscreen zoom the selected shell
 - `Esc` or `b`: close the sidebar
+
+Sidebar section order is:
+
+- `SETTINGS`
+- `WORK`
+- `AGENTS`
+- `TMUX`
 
 ## Command Bar
 
@@ -63,6 +71,15 @@ Examples:
 - `:z`, `:zoom`: zoom to the selected shell
 - `:fit`: fit all shells in view
 - `:reset`: reset the canvas
+- `:sudo <message>`: send a Root message as `User`
+- `:dm <agent_id|AgentNumber|root> <message>`: send a direct message as `User`
+- `:cm <message>`: send a public chatter message as `User`
+
+Notes:
+
+- dialog/input modals automatically take input focus and suppress global shortcuts while they are open
+- command-bar `:dm 10 hi` resolves `10` against the current session's `Agent 10`
+- `:cm` maps to public chatter for the current session only
 
 ## Close Confirmation
 

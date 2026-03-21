@@ -40,7 +40,7 @@ def extract_status(obj: object) -> tuple[str | None, str | None]:
 
 def destroy_shell(sock_path: str, pane_id: str) -> None:
     payload = json.dumps({
-        "command": "destroy_shell",
+        "command": "shell_destroy",
         "session_id": pane_id,
     })
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

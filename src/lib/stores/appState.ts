@@ -1,6 +1,13 @@
 import { tick } from 'svelte';
 import { derived, get, writable, type Readable, type Writable } from 'svelte/store';
 import {
+  connectNetworkTiles,
+  deleteWorkItem as deleteWorkItemCommand,
+  disconnectNetworkPort,
+  sendDirectMessageCommand,
+  sendPublicMessageCommand,
+  getWorkItems,
+  getAgentDebugState,
   getClaudeMenuDataForPane,
   getLayoutState,
   getTmuxState,
@@ -12,32 +19,49 @@ import {
   renameWindow,
   resizeWindow,
   saveLayoutState,
+  sendRootMessageCommand,
   selectSession,
   selectWindow,
   setPaneTitle,
+  spawnBrowserWindow,
+  spawnAgentWindow,
   writePane,
 } from '../tauri';
 import type {
+  AgentActivityEntry,
+  AgentDebugState,
+  AgentInfo,
   ArrangementMode,
   AppStateTree,
   CanvasState,
   CanvasZoomMode,
+  ChatterEntry,
   ClaudeCommandDescriptor,
+  ClosePaneConfirmation,
   CloseTabConfirmation,
   ContextMenuItem,
   ContextMenuState,
+  DebugTab,
   HerdMode,
   LayoutEntry,
   LayoutStateMap,
+  NetworkConnection,
+  NetworkTileKind,
+  PortMode,
   PendingSpawnPlacement,
   PaneViewportHint,
   PaneKind,
   PtyOutputEvent,
+  SidebarSection,
   SidebarTreeItem,
   Tab,
   TerminalInfo,
   TestDriverProjection,
   TestDriverStatus,
+  TopicInfo,
+  TilePort,
+  WorkCanvasCard,
+  WorkItem,
   TmuxPane,
   TmuxSession,
   TmuxSnapshot,
@@ -49,24 +73,38 @@ const GRID_SNAP = 20;
 const GAP = 30;
 const DEFAULT_TILE_WIDTH = 640;
 const DEFAULT_TILE_HEIGHT = 400;
+const WORK_CARD_WIDTH = 360;
+const WORK_CARD_HEIGHT = 320;
+const DEFAULT_DEBUG_PANE_HEIGHT = 200;
+const NETWORK_CURVE_MIN_HANDLE = 36;
+const NETWORK_CURVE_MAX_HANDLE = 120;
+const NETWORK_SNAP_DISTANCE = 28;
+const SIDEBAR_SECTIONS: SidebarSection[] = ['settings', 'work', 'agents', 'tmux'];
 const AUTO_ARRANGE_PATTERNS: ArrangementMode[] = ['circle', 'snowflake', 'stack-down', 'stack-right', 'spiral'];
 
 type TmuxEffect =
   | { type: 'new-session'; name?: string }
   | { type: 'new-window'; sessionId?: string | null }
+  | { type: 'new-agent-window'; sessionId?: string | null }
+  | { type: 'new-browser-window'; sessionId?: string | null }
   | { type: 'kill-session'; sessionId: string }
   | { type: 'kill-window'; windowId: string }
   | { type: 'select-session'; sessionId: string }
   | { type: 'select-window'; windowId: string }
   | { type: 'rename-session'; sessionId: string; name: string }
   | { type: 'rename-window'; windowId: string; name: string }
-  | { type: 'write-pane'; paneId: string; data: string };
+  | { type: 'write-pane'; paneId: string; data: string }
+  | { type: 'open-work-dialog'; placement: PendingSpawnPlacement | null };
 
 export type UiIntent =
   | { type: 'new-shell' }
+  | { type: 'new-agent' }
+  | { type: 'new-browser' }
   | { type: 'new-tab' }
   | { type: 'close-selected-pane' }
   | { type: 'close-active-tab' }
+  | { type: 'confirm-close-pane' }
+  | { type: 'cancel-close-pane' }
   | { type: 'confirm-close-active-tab' }
   | { type: 'cancel-close-active-tab' }
   | { type: 'select-session'; sessionId: string }
@@ -75,8 +113,12 @@ export type UiIntent =
   | { type: 'rename-active-tab'; name: string }
   | { type: 'rename-selected-pane'; name: string }
   | { type: 'toggle-sidebar' }
+  | { type: 'set-sidebar-section'; section: SidebarSection }
+  | { type: 'move-sidebar-section'; delta: number }
   | { type: 'set-sidebar-selection'; index: number }
   | { type: 'move-sidebar-selection'; delta: number }
+  | { type: 'select-work-item'; workId: string }
+  | { type: 'select-agent-item'; agentId: string }
   | { type: 'toggle-debug' }
   | { type: 'open-command-bar' }
   | { type: 'close-command-bar' }
@@ -89,11 +131,15 @@ export type UiIntent =
   | { type: 'toggle-selected-zoom'; viewportWidth: number; viewportHeight: number }
   | { type: 'toggle-selected-fullscreen-zoom'; viewportWidth: number; viewportHeight: number }
   | { type: 'move-selected-pane'; dx: number; dy: number }
+  | { type: 'select-debug-tab'; tab: DebugTab }
   | { type: 'reset-canvas' };
 
 export type CommandBarAction =
   | { type: 'intent'; intent: UiIntent }
   | { type: 'new-tab'; name?: string }
+  | { type: 'dm'; target: string; message: string }
+  | { type: 'cm'; message: string }
+  | { type: 'sudo'; message: string }
   | { type: 'close-all' }
   | { type: 'zoom-selected' }
   | { type: 'fit-all' }
@@ -105,9 +151,13 @@ const initialUiState: UiState = {
   commandText: '',
   helpOpen: false,
   sidebarOpen: false,
+  sidebarSection: 'tmux',
   sidebarSelectedIdx: 0,
   debugPaneOpen: false,
+  debugPaneHeight: DEFAULT_DEBUG_PANE_HEIGHT,
+  debugTab: 'logs',
   selectedPaneId: null,
+  selectedWorkId: null,
   paneViewportHints: {},
   arrangementCycleBySession: {},
   arrangementModeBySession: {},
@@ -118,6 +168,7 @@ const initialUiState: UiState = {
   },
   zoomBookmark: null,
   closeTabConfirmation: null,
+  closePaneConfirmation: null,
   contextMenu: null,
   pendingSpawnPlacement: null,
 };
@@ -139,13 +190,93 @@ export const initialAppState: AppStateTree = {
   layout: {
     entries: {},
   },
+  agents: {},
+  topics: {},
+  chatter: [],
+  agentLogs: [],
+  network: {
+    connections: [],
+  },
+  work: {
+    items: {},
+    order: [],
+  },
   ui: initialUiState,
 };
 
 export const appState = writable<AppStateTree>(initialAppState);
 
+let workDialogOpener: ((placement: PendingSpawnPlacement | null) => void) | null = null;
+
+interface NetworkDragState {
+  tileId: string;
+  port: TilePort;
+  grabbedTileId: string;
+  grabbedPort: TilePort;
+  startX: number;
+  startY: number;
+  currentX: number;
+  currentY: number;
+  startedOccupied: boolean;
+  detachedConnectionKey: string | null;
+  snappedTileId: string | null;
+  snappedPort: TilePort | null;
+  snappedX: number | null;
+  snappedY: number | null;
+}
+
+export const activeNetworkDrag = writable<NetworkDragState | null>(null);
+
+interface NetworkReleaseAnimationState {
+  connectionKey: string;
+  anchorTileId: string;
+  anchorPort: TilePort;
+  anchorX: number;
+  anchorY: number;
+  looseX: number;
+  looseY: number;
+  loosePort: TilePort;
+}
+
+export const networkReleaseAnimation = writable<NetworkReleaseAnimationState | null>(null);
+
+export function clearNetworkReleaseAnimation() {
+  networkReleaseAnimation.set(null);
+}
+
+interface Point {
+  x: number;
+  y: number;
+}
+
+interface TileRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export function registerWorkDialogOpener(
+  opener: (placement: PendingSpawnPlacement | null) => void,
+): () => void {
+  workDialogOpener = opener;
+  return () => {
+    if (workDialogOpener === opener) {
+      workDialogOpener = null;
+    }
+  };
+}
+
 function snapToGrid(value: number): number {
   return Math.round(value / GRID_SNAP) * GRID_SNAP;
+}
+
+function workLayoutKey(workId: string): string {
+  return `work:${workId}`;
+}
+
+function isWorkLayoutKey(entryId: string): boolean {
+  return entryId.startsWith('work:');
 }
 
 function rectsOverlap(
@@ -327,49 +458,94 @@ function toggleSelectedZoom(
 
 export function buildSidebarItems(state: AppStateTree): SidebarTreeItem[] {
   const items: SidebarTreeItem[] = [];
+  const activeSessionId = state.tmux.activeSessionId;
+  if (!activeSessionId) {
+    return items;
+  }
 
-  for (const sessionId of state.tmux.sessionOrder) {
-    const session = state.tmux.sessions[sessionId];
-    if (!session) continue;
+  const session = state.tmux.sessions[activeSessionId];
+  if (!session) {
+    return items;
+  }
+  items.push({
+    type: 'session',
+    label: session.name,
+    indent: 0,
+    sessionId: activeSessionId,
+  });
+
+  for (const windowId of session.window_ids) {
+    const window = state.tmux.windows[windowId];
+    if (!window) continue;
+    const paneId = window.pane_ids[0];
+    const windowPane = paneId ? state.tmux.panes[paneId] : null;
     items.push({
-      type: 'session',
-      label: session.name,
-      indent: 0,
-      sessionId,
+      type: 'window',
+      label: `${window.index}: ${defaultWindowTitle(window, windowPane)}`,
+      indent: 1,
+      sessionId: activeSessionId,
+      windowId,
+      command: windowPane?.command,
+      dead: windowPane?.dead,
     });
 
-    for (const windowId of session.window_ids) {
-      const window = state.tmux.windows[windowId];
-      if (!window) continue;
-      const paneId = window.pane_ids[0];
-      const windowPane = paneId ? state.tmux.panes[paneId] : null;
-      items.push({
-        type: 'window',
-        label: `${window.index}: ${defaultWindowTitle(window, windowPane)}`,
-        indent: 1,
-        sessionId,
-        windowId,
-        command: windowPane?.command,
-        dead: windowPane?.dead,
-      });
-
-      if (!paneId) continue;
-      const pane = state.tmux.panes[paneId];
-      if (!pane) continue;
-      items.push({
-        type: 'pane',
-        label: defaultPaneTitle(pane),
-        indent: 2,
-        sessionId,
-        windowId,
-        paneId,
-        command: pane.command,
-        dead: pane.dead,
-      });
-    }
+    if (!paneId) continue;
+    const pane = state.tmux.panes[paneId];
+    if (!pane) continue;
+    items.push({
+      type: 'pane',
+      label: defaultPaneTitle(pane),
+      indent: 2,
+      sessionId: activeSessionId,
+      windowId,
+      paneId,
+      command: pane.command,
+      dead: pane.dead,
+    });
   }
 
   return items;
+}
+
+function activeSessionWorkItemsInState(state: AppStateTree): WorkItem[] {
+  const activeSessionId = state.tmux.activeSessionId;
+  return state.work.order
+    .map((workId) => state.work.items[workId])
+    .filter(
+      (item): item is WorkItem =>
+        Boolean(item) && (!activeSessionId || item.session_id === activeSessionId),
+    );
+}
+
+function activeSessionAgentsInState(state: AppStateTree): AgentInfo[] {
+  const activeSessionId = state.tmux.activeSessionId;
+  return Object.values(state.agents)
+    .filter((agent) => !activeSessionId || agent.session_id === activeSessionId)
+    .sort((left, right) => left.display_name.localeCompare(right.display_name));
+}
+
+function selectFirstWorkId(state: AppStateTree): string | null {
+  return activeSessionWorkItemsInState(state)[0]?.work_id ?? null;
+}
+
+function selectFirstAgentPaneId(state: AppStateTree): string | null {
+  return activeSessionAgentsInState(state)[0]?.tile_id ?? null;
+}
+
+function isAgentPaneSelected(state: AppStateTree): boolean {
+  const selectedPaneId = state.ui.selectedPaneId;
+  if (!selectedPaneId) return false;
+  return activeSessionAgentsInState(state).some((agent) => agent.tile_id === selectedPaneId);
+}
+
+function sidebarSectionForState(state: AppStateTree): SidebarSection {
+  if (state.ui.selectedWorkId && activeSessionWorkItemsInState(state).some((item) => item.work_id === state.ui.selectedWorkId)) {
+    return 'work';
+  }
+  if (isAgentPaneSelected(state)) {
+    return 'agents';
+  }
+  return 'tmux';
 }
 
 function clampSidebarIndex(state: AppStateTree, index: number): number {
@@ -409,6 +585,35 @@ function sidebarAnchorIndex(state: AppStateTree): number {
   return 0;
 }
 
+function selectedWorkIdForSession(
+  state: AppStateTree,
+  preferredWorkId: string | null = state.ui.selectedWorkId,
+  fallbackToFirst = false,
+): string | null {
+  const workItems = activeSessionWorkItemsInState(state);
+  if (workItems.length === 0) {
+    return null;
+  }
+  if (preferredWorkId && workItems.some((item) => item.work_id === preferredWorkId)) {
+    return preferredWorkId;
+  }
+  return fallbackToFirst ? workItems[0].work_id : null;
+}
+
+function selectedAgentPaneIdForSession(
+  state: AppStateTree,
+  preferredPaneId: string | null = state.ui.selectedPaneId,
+): string | null {
+  const agents = activeSessionAgentsInState(state);
+  if (agents.length === 0) {
+    return null;
+  }
+  if (preferredPaneId && agents.some((agent) => agent.tile_id === preferredPaneId)) {
+    return preferredPaneId;
+  }
+  return agents[0].tile_id;
+}
+
 function countPanesInSession(tmux: AppStateTree['tmux'], sessionId: string): number {
   const session = tmux.sessions[sessionId];
   if (!session) return 0;
@@ -434,9 +639,71 @@ function buildCloseTabConfirmation(
   };
 }
 
+function buildClosePaneConfirmation(state: AppStateTree, paneId: string): ClosePaneConfirmation | null {
+  const pane = state.tmux.panes[paneId];
+  if (!pane || pane.role !== 'root_agent') {
+    return null;
+  }
+  return {
+    paneId,
+    title: 'CLOSE ROOT AGENT',
+    message: 'Close this Root agent? Herd will restart it automatically.',
+    confirmLabel: 'Close Root Agent',
+  };
+}
+
 function selectedSidebarItem(state: AppStateTree): SidebarTreeItem | null {
+  if (state.ui.sidebarSection !== 'tmux') {
+    return null;
+  }
   const items = buildSidebarItems(state);
   return items[clampSidebarIndex(state, state.ui.sidebarSelectedIdx)] ?? null;
+}
+
+function focusSidebarSectionState(state: AppStateTree, section: SidebarSection): AppStateTree {
+  if (section === 'work') {
+    return {
+      ...state,
+      ui: {
+        ...state.ui,
+        sidebarSection: 'work',
+        selectedPaneId: null,
+        selectedWorkId: selectedWorkIdForSession(state, state.ui.selectedWorkId, true),
+      },
+    };
+  }
+
+  if (section === 'agents') {
+    return {
+      ...state,
+      ui: {
+        ...state.ui,
+        sidebarSection: 'agents',
+        selectedPaneId: selectedAgentPaneIdForSession(state),
+        selectedWorkId: null,
+      },
+    };
+  }
+
+  if (section === 'tmux') {
+    return {
+      ...state,
+      ui: {
+        ...state.ui,
+        sidebarSection: 'tmux',
+        sidebarSelectedIdx: clampSidebarIndex(state, state.ui.sidebarSelectedIdx ?? sidebarAnchorIndex(state)),
+        selectedWorkId: null,
+      },
+    };
+  }
+
+  return {
+    ...state,
+    ui: {
+      ...state.ui,
+      sidebarSection: 'settings',
+    },
+  };
 }
 
 export function buildSidebarRenameCommand(state: AppStateTree): string | null {
@@ -470,12 +737,18 @@ function paneKindForPane(state: AppStateTree, paneId: string): PaneKind {
     return 'regular';
   }
 
-  if (pane.role === 'claude' || pane.role === 'output') {
+  if (pane.role === 'claude' || pane.role === 'root_agent' || pane.role === 'output' || pane.role === 'browser') {
     return pane.role;
   }
 
   const titleSignals = [pane.title, window.name].join(' ');
-  if (titleSignals.includes('Claude Code') || /\bclaude\b/i.test(pane.command)) {
+  if (/\bbrowser\b/i.test(titleSignals)) {
+    return 'browser';
+  }
+  if (titleSignals.includes('Root')) {
+    return 'root_agent';
+  }
+  if (titleSignals.includes('Agent') || titleSignals.includes('Claude Code') || /\bclaude\b/i.test(pane.command)) {
     return 'claude';
   }
 
@@ -566,6 +839,9 @@ export function buildContextMenuItems(state: AppStateTree): ContextMenuItem[] {
   if (contextMenu.target === 'canvas') {
     return [
       { id: 'new-shell', label: 'New Shell', kind: 'action', disabled: false },
+      { id: 'new-agent', label: 'New Agent', kind: 'action', disabled: false },
+      { id: 'new-browser', label: 'New Browser', kind: 'action', disabled: false },
+      { id: 'new-work', label: 'New Work', kind: 'action', disabled: false },
     ];
   }
 
@@ -600,7 +876,12 @@ export function buildContextMenuItems(state: AppStateTree): ContextMenuItem[] {
     items.push({ id: 'separator-skills', label: '', kind: 'separator', disabled: true });
   }
 
-  items.push({ id: 'close-shell', label: 'Close Shell', kind: 'action', disabled: false });
+  items.push({
+    id: 'close-shell',
+    label: paneKindForPane(state, contextMenu.paneId) === 'root_agent' ? 'Close Root Agent' : 'Close Shell',
+    kind: 'action',
+    disabled: false,
+  });
 
   if (paneKindForPane(state, contextMenu.paneId) === 'claude') {
     const skillNames = new Set(contextMenu.claudeSkills.map((command) => command.name));
@@ -638,25 +919,43 @@ export function reduceContextMenuSelection(
     return { state, effects: [] };
   }
 
-  if (itemId === 'new-shell' && contextMenu.target === 'canvas') {
+  if (
+    (itemId === 'new-shell' || itemId === 'new-agent' || itemId === 'new-browser' || itemId === 'new-work')
+    && contextMenu.target === 'canvas'
+  ) {
     const sessionId = state.tmux.activeSessionId;
     if (!sessionId || contextMenu.worldX === null || contextMenu.worldY === null) {
       return { state: dismissContextMenuInState(state), effects: [] };
     }
     const dismissedState = dismissContextMenuInState(state);
+    const placement = {
+      sessionId,
+      worldX: contextMenu.worldX,
+      worldY: contextMenu.worldY,
+    };
+    if (itemId === 'new-work') {
+      return {
+        state: dismissedState,
+        effects: [{ type: 'open-work-dialog', placement }],
+      };
+    }
     return {
       state: {
         ...dismissedState,
         ui: {
           ...dismissedState.ui,
-          pendingSpawnPlacement: {
-            sessionId,
-            worldX: contextMenu.worldX,
-            worldY: contextMenu.worldY,
-          },
+          pendingSpawnPlacement: placement,
         },
       },
-      effects: [{ type: 'new-window', sessionId }],
+      effects: [{
+        type:
+          itemId === 'new-agent'
+            ? 'new-agent-window'
+            : itemId === 'new-browser'
+              ? 'new-browser-window'
+              : 'new-window',
+        sessionId,
+      }],
     };
   }
 
@@ -703,6 +1002,12 @@ function reconcileLayoutEntries(
   windows: Record<string, TmuxWindow>,
 ): Record<string, LayoutEntry> {
   const nextEntries: Record<string, LayoutEntry> = {};
+
+  for (const [entryId, entry] of Object.entries(previousEntries)) {
+    if (isWorkLayoutKey(entryId)) {
+      nextEntries[entryId] = entry;
+    }
+  }
 
   for (const session of Object.values(sessions)) {
     for (const windowId of session.window_ids) {
@@ -959,19 +1264,30 @@ export function applyTmuxSnapshotToState(
   const closeTabConfirmation = previousState.ui.closeTabConfirmation
     ? buildCloseTabConfirmation(nextTmux, previousState.ui.closeTabConfirmation.sessionId)
     : null;
+  const closePaneConfirmation = previousState.ui.closePaneConfirmation
+    ? buildClosePaneConfirmation({ ...previousState, tmux: nextTmux }, previousState.ui.closePaneConfirmation.paneId)
+    : null;
 
   let nextState: AppStateTree = {
     tmux: nextTmux,
     layout: {
       entries: snappedLayoutEntries,
     },
+    agents: previousState.agents,
+    topics: previousState.topics,
+    chatter: previousState.chatter,
+    agentLogs: previousState.agentLogs,
+    network: previousState.network,
+    work: previousState.work,
     ui: {
       ...previousState.ui,
       selectedPaneId,
+      selectedWorkId: selectedWorkIdForSession({ ...previousState, tmux: nextTmux }),
       paneViewportHints,
       arrangementCycleBySession,
       arrangementModeBySession,
       closeTabConfirmation,
+      closePaneConfirmation,
       pendingSpawnPlacement: pendingPlacement.pendingSpawnPlacement,
       sidebarSelectedIdx: previousState.ui.sidebarSelectedIdx,
     },
@@ -985,6 +1301,7 @@ export function applyTmuxSnapshotToState(
     nextState = applyArrangementPattern(nextState, sessionId, pattern).state;
   }
   nextState.ui.sidebarSelectedIdx = clampSidebarIndex(nextState, nextState.ui.sidebarSelectedIdx);
+  nextState.ui.sidebarSection = sidebarSectionForState(nextState);
   return nextState;
 }
 
@@ -1042,11 +1359,33 @@ export function reduceIntent(
         ? { state, effects: [{ type: 'new-window', sessionId: state.tmux.activeSessionId }] }
         : { state, effects: [] };
 
+    case 'new-agent':
+      return state.tmux.activeSessionId
+        ? { state, effects: [{ type: 'new-agent-window', sessionId: state.tmux.activeSessionId }] }
+        : { state, effects: [] };
+
+    case 'new-browser':
+      return state.tmux.activeSessionId
+        ? { state, effects: [{ type: 'new-browser-window', sessionId: state.tmux.activeSessionId }] }
+        : { state, effects: [] };
+
     case 'new-tab':
       return { state, effects: [{ type: 'new-session' }] };
 
     case 'close-selected-pane': {
       const paneId = state.ui.selectedPaneId;
+      if (paneId && state.tmux.panes[paneId]?.role === 'root_agent') {
+        return {
+          state: {
+            ...state,
+            ui: {
+              ...state.ui,
+              closePaneConfirmation: buildClosePaneConfirmation(state, paneId),
+            },
+          },
+          effects: [],
+        };
+      }
       const windowId = paneId ? state.tmux.panes[paneId]?.window_id : null;
       const sessionId = paneId ? state.tmux.panes[paneId]?.session_id : null;
       const session = sessionId ? state.tmux.sessions[sessionId] : null;
@@ -1060,6 +1399,7 @@ export function reduceIntent(
             ui: {
               ...state.ui,
               closeTabConfirmation: buildCloseTabConfirmation(state.tmux, sessionId, true),
+              closePaneConfirmation: null,
             },
           },
           effects: [],
@@ -1067,6 +1407,34 @@ export function reduceIntent(
       }
       return { state, effects: [{ type: 'kill-window', windowId }] };
     }
+
+    case 'confirm-close-pane':
+      return state.ui.closePaneConfirmation
+        ? {
+          state: {
+            ...state,
+            ui: {
+              ...state.ui,
+              closePaneConfirmation: null,
+            },
+          },
+          effects: state.tmux.panes[state.ui.closePaneConfirmation.paneId]
+            ? [{ type: 'kill-window', windowId: state.tmux.panes[state.ui.closePaneConfirmation.paneId].window_id }]
+            : [],
+        }
+        : { state, effects: [] };
+
+    case 'cancel-close-pane':
+      return {
+        state: {
+          ...state,
+          ui: {
+            ...state.ui,
+            closePaneConfirmation: null,
+          },
+        },
+        effects: [],
+      };
 
     case 'close-active-tab':
       if (!state.tmux.activeSessionId) {
@@ -1080,6 +1448,7 @@ export function reduceIntent(
             ui: {
               ...state.ui,
               closeTabConfirmation,
+              closePaneConfirmation: null,
             },
           },
           effects: closeTabConfirmation
@@ -1096,6 +1465,7 @@ export function reduceIntent(
             ui: {
               ...state.ui,
               closeTabConfirmation: null,
+              closePaneConfirmation: null,
             },
           },
           effects: [{ type: 'kill-session', sessionId: state.ui.closeTabConfirmation.sessionId }],
@@ -1109,6 +1479,7 @@ export function reduceIntent(
           ui: {
             ...state.ui,
             closeTabConfirmation: null,
+            closePaneConfirmation: null,
           },
         },
         effects: [],
@@ -1159,20 +1530,48 @@ export function reduceIntent(
           ui: {
             ...state.ui,
             sidebarOpen: !state.ui.sidebarOpen,
+            sidebarSection: state.ui.sidebarOpen ? state.ui.sidebarSection : sidebarSectionForState(state),
             sidebarSelectedIdx: state.ui.sidebarOpen ? state.ui.sidebarSelectedIdx : sidebarAnchorIndex(state),
           },
         },
         effects: [],
       };
 
+    case 'set-sidebar-section':
+      return {
+        state: focusSidebarSectionState(state, intent.section),
+        effects: [],
+      };
+
+    case 'move-sidebar-section': {
+      const currentIndex = SIDEBAR_SECTIONS.indexOf(state.ui.sidebarSection);
+      const nextIndex = Math.max(0, Math.min(SIDEBAR_SECTIONS.length - 1, currentIndex + intent.delta));
+      return {
+        state: focusSidebarSectionState(state, SIDEBAR_SECTIONS[nextIndex] ?? 'tmux'),
+        effects: [],
+      };
+    }
+
     case 'set-sidebar-selection': {
+      if (state.ui.sidebarSection !== 'tmux') {
+        return reduceIntent(
+          {
+            ...state,
+            ui: {
+              ...state.ui,
+              sidebarSection: 'tmux',
+            },
+          },
+          intent,
+        );
+      }
       const sidebarSelectedIdx = clampSidebarIndex(state, intent.index);
       const item = buildSidebarItems(state)[sidebarSelectedIdx];
       if (!item) {
         return {
           state: {
             ...state,
-            ui: { ...state.ui, sidebarSelectedIdx },
+            ui: { ...state.ui, sidebarSection: 'tmux', sidebarSelectedIdx, selectedWorkId: null },
           },
           effects: [],
         };
@@ -1191,8 +1590,10 @@ export function reduceIntent(
             ...state,
             ui: {
               ...state.ui,
+              sidebarSection: 'tmux',
               sidebarSelectedIdx,
               selectedPaneId: item.paneId,
+              selectedWorkId: null,
             },
           },
           effects,
@@ -1213,8 +1614,10 @@ export function reduceIntent(
             ...state,
             ui: {
               ...state.ui,
+              sidebarSection: 'tmux',
               sidebarSelectedIdx,
               selectedPaneId,
+              selectedWorkId: null,
             },
           },
           effects,
@@ -1227,8 +1630,10 @@ export function reduceIntent(
             ...state,
             ui: {
               ...state.ui,
+              sidebarSection: 'tmux',
               sidebarSelectedIdx,
               selectedPaneId: preferredPaneIdForSession(state, item.sessionId) ?? state.ui.selectedPaneId,
+              selectedWorkId: null,
             },
           },
           effects: state.tmux.activeSessionId === item.sessionId
@@ -1246,14 +1651,102 @@ export function reduceIntent(
       };
     }
 
-    case 'move-sidebar-selection':
+    case 'move-sidebar-selection': {
+      if (state.ui.sidebarSection === 'work') {
+        const items = activeSessionWorkItemsInState(state);
+        if (items.length === 0) {
+          return { state, effects: [] };
+        }
+        const currentIndex = Math.max(
+          0,
+          items.findIndex((item) => item.work_id === selectedWorkIdForSession(state, state.ui.selectedWorkId, true)),
+        );
+        const nextIndex = Math.max(0, Math.min(items.length - 1, currentIndex + intent.delta));
+        return {
+          state: {
+            ...state,
+            ui: {
+              ...state.ui,
+              sidebarSection: 'work',
+              selectedPaneId: null,
+              selectedWorkId: items[nextIndex]?.work_id ?? null,
+            },
+          },
+          effects: [],
+        };
+      }
+
+      if (state.ui.sidebarSection === 'agents') {
+        const agents = activeSessionAgentsInState(state);
+        if (agents.length === 0) {
+          return { state, effects: [] };
+        }
+        const currentIndex = Math.max(
+          0,
+          agents.findIndex((agent) => agent.tile_id === selectedAgentPaneIdForSession(state)),
+        );
+        const nextIndex = Math.max(0, Math.min(agents.length - 1, currentIndex + intent.delta));
+        return {
+          state: {
+            ...state,
+            ui: {
+              ...state.ui,
+              sidebarSection: 'agents',
+              selectedPaneId: agents[nextIndex]?.tile_id ?? null,
+              selectedWorkId: null,
+            },
+          },
+          effects: [],
+        };
+      }
+
+      if (state.ui.sidebarSection === 'settings') {
+        return { state, effects: [] };
+      }
+
       return reduceIntent(state, {
         type: 'set-sidebar-selection',
         index: state.ui.sidebarSelectedIdx + intent.delta,
       });
+    }
+
+    case 'select-work-item':
+      return {
+        state: {
+          ...state,
+          ui: {
+            ...state.ui,
+            sidebarSection: 'work',
+            selectedWorkId: selectedWorkIdForSession(state, intent.workId),
+          },
+        },
+        effects: [],
+      };
+
+    case 'select-agent-item': {
+      const agent = state.agents[intent.agentId];
+      if (!agent) {
+        return { state, effects: [] };
+      }
+      return {
+        state: {
+          ...state,
+          ui: {
+            ...state.ui,
+            sidebarSection: 'agents',
+            selectedPaneId: agent.tile_id,
+            selectedWorkId: null,
+          },
+        },
+        effects: [],
+      };
+    }
 
     case 'toggle-debug':
       return { state: { ...state, ui: { ...state.ui, debugPaneOpen: !state.ui.debugPaneOpen } }, effects: [] };
+
+    case 'select-debug-tab':
+      return { state: { ...state, ui: { ...state.ui, debugTab: intent.tab } }, effects: [] };
 
     case 'open-command-bar':
       return { state: { ...state, ui: { ...state.ui, commandBarOpen: true } }, effects: [] };
@@ -1347,6 +1840,12 @@ async function runEffect(effect: TmuxEffect) {
     case 'new-window':
       await newWindow(effect.sessionId ?? null);
       break;
+    case 'new-agent-window':
+      await spawnAgentWindow(effect.sessionId ?? null);
+      break;
+    case 'new-browser-window':
+      await spawnBrowserWindow(effect.sessionId ?? null);
+      break;
     case 'kill-session':
       await killSession(effect.sessionId);
       break;
@@ -1368,6 +1867,9 @@ async function runEffect(effect: TmuxEffect) {
     case 'write-pane':
       await writePane(effect.paneId, effect.data);
       break;
+    case 'open-work-dialog':
+      workDialogOpener?.(effect.placement);
+      break;
   }
 }
 
@@ -1388,11 +1890,45 @@ export async function selectContextMenuItem(itemId: string) {
 }
 
 export async function bootstrapAppState() {
-  const [layout, snapshot] = await Promise.all([getLayoutState(), getTmuxState()]);
-  appState.update((state) => applyTmuxSnapshotToState({
-    ...state,
-    layout: { entries: layout },
-  }, snapshot));
+  const [layout, snapshot, debugState, workItems] = await Promise.all([
+    getLayoutState(),
+    getTmuxState(),
+    getAgentDebugState().catch(() => ({ agents: [], topics: [], chatter: [], agent_logs: [], connections: [] } satisfies AgentDebugState)),
+    getWorkItems().catch(() => [] as WorkItem[]),
+  ]);
+  const nextState = applyWorkItemsToState(
+    applyAgentDebugStateToState(
+      applyTmuxSnapshotToState(
+        {
+          ...get(appState),
+          layout: { entries: layout },
+        },
+        snapshot,
+      ),
+      debugState,
+    ),
+    workItems,
+  );
+  appState.set(nextState);
+  await persistChangedWorkLayoutEntries(layout, nextState.layout.entries);
+  const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 1280;
+  const viewportHeight = typeof window !== 'undefined' ? window.innerHeight - 54 : 720;
+  fitCanvasToActiveTab(viewportWidth, viewportHeight);
+}
+
+export async function refreshWorkItems(sessionId?: string | null) {
+  const items = await getWorkItems(sessionId ?? null).catch(() => [] as WorkItem[]);
+  const previousState = get(appState);
+  const nextState = applyWorkItemsToState(previousState, items);
+  appState.set(nextState);
+  await persistChangedWorkLayoutEntries(previousState.layout.entries, nextState.layout.entries);
+}
+
+export async function refreshAgentDebugState() {
+  const debugState = await getAgentDebugState().catch(
+    () => ({ agents: [], topics: [], chatter: [], agent_logs: [], connections: [] } satisfies AgentDebugState),
+  );
+  appState.update((state) => applyAgentDebugStateToState(state, debugState));
 }
 
 export function applyTmuxSnapshot(snapshot: TmuxSnapshot) {
@@ -1412,6 +1948,14 @@ export function applyPaneReadOnly(paneId: string, readOnly: boolean) {
 
 export function applyPaneRole(paneId: string, role: PaneKind) {
   appState.update((state) => applyPaneRoleToState(state, paneId, role));
+}
+
+export function applyAgentDebugState(debugState: AgentDebugState) {
+  appState.update((state) => applyAgentDebugStateToState(state, debugState));
+}
+
+export function appendChatterEntry(entry: ChatterEntry) {
+  appState.update((state) => appendChatterEntryToState(state, entry));
 }
 
 function createWritableSlice<T>(
@@ -1464,9 +2008,24 @@ export const debugPaneOpen = createWritableSlice<boolean>(
   (state, value) => ({ ...state, ui: { ...state.ui, debugPaneOpen: value } }),
 );
 
+export const debugPaneHeight = createWritableSlice<number>(
+  (state) => state.ui.debugPaneHeight,
+  (state, value) => ({ ...state, ui: { ...state.ui, debugPaneHeight: value } }),
+);
+
+export const debugTab = createWritableSlice<DebugTab>(
+  (state) => state.ui.debugTab,
+  (state, value) => ({ ...state, ui: { ...state.ui, debugTab: value } }),
+);
+
 export const closeTabConfirmation = createWritableSlice<CloseTabConfirmation | null>(
   (state) => state.ui.closeTabConfirmation,
   (state, value) => ({ ...state, ui: { ...state.ui, closeTabConfirmation: value } }),
+);
+
+export const closePaneConfirmation = createWritableSlice<ClosePaneConfirmation | null>(
+  (state) => state.ui.closePaneConfirmation,
+  (state, value) => ({ ...state, ui: { ...state.ui, closePaneConfirmation: value } }),
 );
 
 export const contextMenuState = derived(appState, ($state) => $state.ui.contextMenu);
@@ -1478,7 +2037,17 @@ export const canvasState = createWritableSlice<CanvasState>(
 
 export const selectedTerminalId = createWritableSlice<string | null>(
   (state) => state.ui.selectedPaneId,
-  (state, value) => ({ ...state, ui: { ...state.ui, selectedPaneId: value } }),
+  (state, value) => ({ ...state, ui: { ...state.ui, selectedPaneId: value, selectedWorkId: null } }),
+);
+
+export const selectedWorkId = createWritableSlice<string | null>(
+  (state) => state.ui.selectedWorkId,
+  (state, value) => ({ ...state, ui: { ...state.ui, selectedWorkId: value } }),
+);
+
+export const sidebarSection = createWritableSlice<SidebarSection>(
+  (state) => state.ui.sidebarSection,
+  (state, value) => ({ ...state, ui: { ...state.ui, sidebarSection: value } }),
 );
 
 export const tmuxWindows = derived(appState, ($state) =>
@@ -1514,6 +2083,18 @@ export const activeArrangementMode = derived(appState, ($state) => {
 
 export const sidebarItems = derived(appState, ($state) => buildSidebarItems($state));
 export const contextMenuItems = derived(appState, ($state) => buildContextMenuItems($state));
+export const chatterEntries = derived(appState, ($state) => $state.chatter);
+export const agentInfos = derived(appState, ($state) =>
+  activeSessionAgentsInState($state),
+);
+export const topicInfos = derived(appState, ($state) =>
+  Object.values($state.topics)
+    .filter((topic) => !$state.tmux.activeSessionId || topic.session_id === $state.tmux.activeSessionId)
+    .sort((left, right) => left.name.localeCompare(right.name)),
+);
+export const activeSessionWorkItems = derived(appState, ($state) =>
+  activeSessionWorkItemsInState($state),
+);
 
 export function calculateWindowSizeRequest(
   state: AppStateTree,
@@ -1557,12 +2138,14 @@ function terminalInfoForPane(state: AppStateTree, paneId: string): TerminalInfo 
   const pane = state.tmux.panes[paneId];
   const window = pane ? state.tmux.windows[pane.window_id] : null;
   const entry = window ? state.layout.entries[window.id] : null;
+  const agent = Object.values(state.agents).find((item) => item.tile_id === paneId) ?? null;
   if (!pane || !window || !entry) return null;
   return {
     id: pane.id,
     paneId: pane.id,
     windowId: window.id,
     parentWindowId: window.parent_window_id ?? null,
+    parentWindowSource: window.parent_window_source ?? null,
     sessionId: pane.session_id,
     tabId: pane.session_id,
     x: entry.x,
@@ -1573,7 +2156,226 @@ function terminalInfoForPane(state: AppStateTree, paneId: string): TerminalInfo 
     command: pane.command,
     readOnly: pane.readOnly,
     kind: paneKindForPane(state, pane.id),
+    agentId: agent?.agent_id ?? null,
   };
+}
+
+function buildAgentRecord(agents: AgentInfo[]): Record<string, AgentInfo> {
+  const record: Record<string, AgentInfo> = {};
+  for (const agent of agents) {
+    record[agent.agent_id] = agent;
+  }
+  return record;
+}
+
+function buildTopicRecord(topics: TopicInfo[]): Record<string, TopicInfo> {
+  const record: Record<string, TopicInfo> = {};
+  for (const topic of topics) {
+    record[topic.name] = topic;
+  }
+  return record;
+}
+
+function buildWorkRecord(items: WorkItem[]): { items: Record<string, WorkItem>; order: string[] } {
+  const record: Record<string, WorkItem> = {};
+  for (const item of items) {
+    record[item.work_id] = item;
+  }
+  return {
+    items: record,
+    order: items.map((item) => item.work_id),
+  };
+}
+
+function buildDefaultWorkLayoutEntry(
+  state: AppStateTree,
+  workItems: WorkItem[],
+  entries: Record<string, LayoutEntry>,
+  workId: string,
+): LayoutEntry {
+  const terminals = state.tmux.windowOrder
+    .filter((windowId) => state.tmux.windows[windowId]?.session_id === state.tmux.activeSessionId)
+    .map((windowId) => {
+      const paneId = state.tmux.windows[windowId]?.pane_ids[0];
+      return paneId ? terminalInfoForPane(state, paneId) : null;
+    })
+    .filter((term): term is TerminalInfo => Boolean(term));
+
+  const maxX = terminals.reduce((value, term) => Math.max(value, term.x + term.width), 80);
+  const minY = terminals.reduce((value, term) => Math.min(value, term.y), 80);
+  const baseX = maxX + GAP * 2;
+  const baseY = Number.isFinite(minY) ? minY : 80;
+  const workIndex = workItems.findIndex((item) => item.work_id === workId);
+  const desiredY = baseY + Math.max(0, workIndex) * (WORK_CARD_HEIGHT + GAP);
+
+  const occupiedIds = [
+    ...state.tmux.windowOrder.filter((windowId) => state.tmux.windows[windowId]?.session_id === state.tmux.activeSessionId),
+    ...workItems.map((item) => workLayoutKey(item.work_id)).filter((entryId) => entryId !== workLayoutKey(workId)),
+  ];
+
+  return findOpenPosition(baseX, desiredY, WORK_CARD_WIDTH, WORK_CARD_HEIGHT, occupiedIds, entries);
+}
+
+function ensureWorkLayoutEntries(state: AppStateTree, workItems: WorkItem[]): Record<string, LayoutEntry> {
+  let changed = false;
+  const nextEntries = { ...state.layout.entries };
+
+  for (const item of workItems) {
+    const entryId = workLayoutKey(item.work_id);
+    if (nextEntries[entryId]) {
+      continue;
+    }
+    nextEntries[entryId] = buildDefaultWorkLayoutEntry(state, workItems, nextEntries, item.work_id);
+    changed = true;
+  }
+
+  return changed ? nextEntries : state.layout.entries;
+}
+
+function removeWorkLayoutEntry(entries: Record<string, LayoutEntry>, workId: string): Record<string, LayoutEntry> {
+  const entryId = workLayoutKey(workId);
+  if (!(entryId in entries)) {
+    return entries;
+  }
+  const nextEntries = { ...entries };
+  delete nextEntries[entryId];
+  return nextEntries;
+}
+
+async function persistChangedWorkLayoutEntries(
+  previousEntries: Record<string, LayoutEntry>,
+  nextEntries: Record<string, LayoutEntry>,
+) {
+  const changedEntries = collectChangedLayoutEntries(previousEntries, nextEntries)
+    .filter(([entryId]) => isWorkLayoutKey(entryId));
+  if (changedEntries.length === 0) {
+    return;
+  }
+
+  await Promise.all(
+    changedEntries.map(([entryId, entry]) =>
+      saveLayoutState(entryId, entry.x, entry.y, entry.width, entry.height),
+    ),
+  );
+}
+
+export function applyAgentDebugStateToState(state: AppStateTree, debugState: AgentDebugState): AppStateTree {
+  const activeSessionId = state.tmux.activeSessionId;
+  const agents = activeSessionId
+    ? debugState.agents.filter((agent) => agent.session_id === activeSessionId)
+    : debugState.agents;
+  const topics = activeSessionId
+    ? debugState.topics.filter((topic) => topic.session_id === activeSessionId)
+    : debugState.topics;
+  const chatter = activeSessionId
+    ? debugState.chatter.filter((entry) => entry.session_id === activeSessionId)
+    : debugState.chatter;
+  const agentLogs = activeSessionId
+    ? debugState.agent_logs.filter((entry) => entry.session_id === activeSessionId)
+    : debugState.agent_logs;
+  const nextDebugTab =
+    state.ui.debugTab === 'logs' && chatter.length > 0
+      ? 'chatter'
+      : state.ui.debugTab;
+  return {
+    ...state,
+    agents: buildAgentRecord(agents),
+    topics: buildTopicRecord(topics),
+    chatter,
+    agentLogs,
+    network: {
+      connections: debugState.connections.filter(
+        (connection) => !activeSessionId || connection.session_id === activeSessionId,
+      ),
+    },
+    ui: {
+      ...state.ui,
+      debugTab: nextDebugTab,
+    },
+  };
+}
+
+export function appendChatterEntryToState(state: AppStateTree, entry: ChatterEntry): AppStateTree {
+  if (state.tmux.activeSessionId && entry.session_id !== state.tmux.activeSessionId) {
+    return state;
+  }
+  const nextDebugTab = state.ui.debugTab === 'logs' ? 'chatter' : state.ui.debugTab;
+  return {
+    ...state,
+    chatter: [...state.chatter, entry],
+    ui: {
+      ...state.ui,
+      debugTab: nextDebugTab,
+    },
+  };
+}
+
+export function applyWorkItemsToState(state: AppStateTree, workItems: WorkItem[]): AppStateTree {
+  const nextState = {
+    ...state,
+    layout: {
+      entries: ensureWorkLayoutEntries(state, workItems),
+    },
+    work: buildWorkRecord(workItems),
+  };
+  return {
+    ...nextState,
+    ui: {
+      ...nextState.ui,
+      selectedWorkId: selectedWorkIdForSession(nextState),
+      sidebarSection: sidebarSectionForState(nextState),
+    },
+  };
+}
+
+export function buildAgentActivityEntries(state: AppStateTree, paneId: string): AgentActivityEntry[] {
+  const agent = Object.values(state.agents).find((item) => item.tile_id === paneId);
+  if (!agent) return [];
+
+  const chatterEntries = state.chatter.flatMap<AgentActivityEntry>((entry) => {
+    if (entry.kind === 'direct') {
+      if (entry.to_agent_id === agent.agent_id) {
+        return [{ kind: 'incoming_dm' as const, text: entry.display_text, timestamp_ms: entry.timestamp_ms }];
+      }
+      if (entry.from_agent_id === agent.agent_id) {
+        return [{ kind: 'outgoing_dm' as const, text: entry.display_text, timestamp_ms: entry.timestamp_ms }];
+      }
+      return [];
+    }
+
+    if (entry.kind === 'public') {
+      if (entry.from_agent_id === agent.agent_id) {
+        return [{ kind: 'outgoing_chatter' as const, text: entry.display_text, timestamp_ms: entry.timestamp_ms }];
+      }
+      if (entry.mentions.includes(agent.agent_id)) {
+        return [{ kind: 'mention' as const, text: entry.display_text, timestamp_ms: entry.timestamp_ms }];
+      }
+      if (entry.topics.some((topic) => agent.topics.includes(topic))) {
+        return [{ kind: 'topic' as const, text: entry.display_text, timestamp_ms: entry.timestamp_ms }];
+      }
+    }
+
+    if (entry.kind === 'network' || entry.kind === 'root') {
+      if (entry.from_agent_id === agent.agent_id) {
+        return [{ kind: 'outgoing_chatter' as const, text: entry.display_text, timestamp_ms: entry.timestamp_ms }];
+      }
+      if (entry.to_agent_id === agent.agent_id) {
+        return [{ kind: 'incoming_dm' as const, text: entry.display_text, timestamp_ms: entry.timestamp_ms }];
+      }
+    }
+
+    return [];
+  });
+
+  const logEntries = state.agentLogs
+    .filter((entry) => entry.tile_id === paneId)
+    .map<AgentActivityEntry>((entry) => ({
+      kind: entry.kind,
+      text: entry.text,
+      timestamp_ms: entry.timestamp_ms,
+    }));
+
+  return [...chatterEntries, ...logEntries].sort((left, right) => left.timestamp_ms - right.timestamp_ms);
 }
 
 export const terminals = derived(appState, ($state) =>
@@ -1595,6 +2397,25 @@ export const activeTabTerminals = derived(appState, ($state) => {
     .filter((term): term is TerminalInfo => Boolean(term));
 });
 
+export function buildCanvasWorkCards(state: AppStateTree): WorkCanvasCard[] {
+  const workItems = activeSessionWorkItemsInState(state);
+  if (workItems.length === 0) return [];
+
+  return workItems.flatMap((item) => {
+    const entry = state.layout.entries[workLayoutKey(item.work_id)];
+    if (!entry) return [];
+    return [{
+      workId: item.work_id,
+      x: entry.x,
+      y: entry.y,
+      width: entry.width,
+      height: entry.height,
+    }];
+  });
+}
+
+export const activeTabWorkCards = derived(appState, ($state) => buildCanvasWorkCards($state));
+
 export interface CanvasConnection {
   childWindowId: string;
   parentWindowId: string;
@@ -1606,6 +2427,322 @@ export interface CanvasConnection {
   cy1: number;
   cx2: number;
   cy2: number;
+}
+
+export interface RenderedNetworkConnection {
+  fromTileId: string;
+  fromPort: 'left' | 'top' | 'right' | 'bottom';
+  toTileId: string;
+  toPort: 'left' | 'top' | 'right' | 'bottom';
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  cx1: number;
+  cy1: number;
+  cx2: number;
+  cy2: number;
+}
+
+export function portModeForTileKind(kind: NetworkTileKind, port: TilePort): PortMode {
+  if ((kind === 'work' || kind === 'browser') && port !== 'left') {
+    return 'read';
+  }
+  return 'read_write';
+}
+
+function tileKindForTileId(state: AppStateTree, tileId: string): NetworkTileKind | null {
+  if (tileId.startsWith('work:')) {
+    return 'work';
+  }
+  const pane = state.tmux.panes[tileId];
+  if (!pane) {
+    return null;
+  }
+  const kind = paneKindForPane(state, tileId);
+  switch (kind) {
+    case 'claude':
+      return 'agent';
+    case 'root_agent':
+      return 'root_agent';
+    case 'browser':
+      return 'browser';
+    case 'output':
+      return 'output';
+    default:
+      return 'shell';
+  }
+}
+
+function networkConnectionKey(connection: NetworkConnection): string {
+  return `${connection.from_tile_id}:${connection.from_port}-${connection.to_tile_id}:${connection.to_port}`;
+}
+
+function renderedNetworkConnectionKey(connection: RenderedNetworkConnection): string {
+  return `${connection.fromTileId}:${connection.fromPort}-${connection.toTileId}:${connection.toPort}`;
+}
+
+function oppositeConnectionEndpoint(
+  connection: NetworkConnection,
+  tileId: string,
+  port: TilePort,
+): { tileId: string; port: TilePort } | null {
+  if (connection.from_tile_id === tileId && connection.from_port === port) {
+    return { tileId: connection.to_tile_id, port: connection.to_port };
+  }
+  if (connection.to_tile_id === tileId && connection.to_port === port) {
+    return { tileId: connection.from_tile_id, port: connection.from_port };
+  }
+  return null;
+}
+
+function connectionForPort(
+  state: AppStateTree,
+  tileId: string,
+  port: TilePort,
+  ignoredConnectionKey?: string | null,
+): NetworkConnection | null {
+  return state.network.connections.find((connection) => {
+    if (ignoredConnectionKey && networkConnectionKey(connection) === ignoredConnectionKey) {
+      return false;
+    }
+    return (
+      (connection.from_tile_id === tileId && connection.from_port === port)
+      || (connection.to_tile_id === tileId && connection.to_port === port)
+    );
+  }) ?? null;
+}
+
+function removeNetworkConnectionFromState(state: AppStateTree, connectionKey: string): AppStateTree {
+  return {
+    ...state,
+    network: {
+      connections: state.network.connections.filter(
+        (connection) => networkConnectionKey(connection) !== connectionKey,
+      ),
+    },
+  };
+}
+
+function upsertNetworkConnectionInState(state: AppStateTree, connection: NetworkConnection): AppStateTree {
+  const connectionKey = networkConnectionKey(connection);
+  return {
+    ...state,
+    network: {
+      connections: [
+        ...state.network.connections.filter(
+          (existing) => networkConnectionKey(existing) !== connectionKey,
+        ),
+        connection,
+      ].sort((left, right) =>
+        networkConnectionKey(left).localeCompare(networkConnectionKey(right), undefined, { numeric: true }),
+      ),
+    },
+  };
+}
+
+function inferredLoosePort(startX: number, startY: number, endX: number, endY: number): TilePort {
+  const dx = endX - startX;
+  const dy = endY - startY;
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return dx >= 0 ? 'left' : 'right';
+  }
+  return dy >= 0 ? 'top' : 'bottom';
+}
+
+function buildNetworkReleaseAnimation(drag: NetworkDragState): NetworkReleaseAnimationState | null {
+  if (!drag.startedOccupied || !drag.detachedConnectionKey) {
+    return null;
+  }
+  const looseX = drag.snappedX ?? drag.currentX;
+  const looseY = drag.snappedY ?? drag.currentY;
+  return {
+    connectionKey: drag.detachedConnectionKey,
+    anchorTileId: drag.tileId,
+    anchorPort: drag.port,
+    anchorX: drag.startX,
+    anchorY: drag.startY,
+    looseX,
+    looseY,
+    loosePort: drag.snappedPort ?? inferredLoosePort(drag.startX, drag.startY, looseX, looseY),
+  };
+}
+
+function activeSessionTileRects(state: AppStateTree): Map<string, TileRect> {
+  const activeSessionId = state.tmux.activeSessionId;
+  const tileRects = new Map<string, TileRect>();
+  if (!activeSessionId) {
+    return tileRects;
+  }
+
+  for (const windowId of state.tmux.windowOrder) {
+    const window = state.tmux.windows[windowId];
+    if (!window || window.session_id !== activeSessionId) continue;
+    const paneId = window.pane_ids[0];
+    if (!paneId) continue;
+    const terminal = terminalInfoForPane(state, paneId);
+    if (terminal) {
+      tileRects.set(paneId, {
+        x: terminal.x,
+        y: terminal.y,
+        width: terminal.width,
+        height: terminal.height,
+      });
+    }
+  }
+
+  for (const card of buildCanvasWorkCards(state)) {
+    tileRects.set(`work:${card.workId}`, {
+      x: card.x,
+      y: card.y,
+      width: card.width,
+      height: card.height,
+    });
+  }
+
+  return tileRects;
+}
+
+function portPoint(rect: TileRect, port: TilePort): Point {
+  switch (port) {
+    case 'left':
+      return { x: rect.x, y: rect.y + rect.height / 2 };
+    case 'top':
+      return { x: rect.x + rect.width / 2, y: rect.y };
+    case 'right':
+      return { x: rect.x + rect.width, y: rect.y + rect.height / 2 };
+    case 'bottom':
+      return { x: rect.x + rect.width / 2, y: rect.y + rect.height };
+  }
+}
+
+function portVector(port: TilePort): Point {
+  switch (port) {
+    case 'left':
+      return { x: -1, y: 0 };
+    case 'top':
+      return { x: 0, y: -1 };
+    case 'right':
+      return { x: 1, y: 0 };
+    case 'bottom':
+      return { x: 0, y: 1 };
+  }
+}
+
+function buildConnectorCurve(fromPoint: Point, fromPort: TilePort, toPoint: Point, toPort: TilePort) {
+  const distance = Math.hypot(toPoint.x - fromPoint.x, toPoint.y - fromPoint.y);
+  const handle = Math.max(
+    NETWORK_CURVE_MIN_HANDLE,
+    Math.min(NETWORK_CURVE_MAX_HANDLE, distance * 0.45),
+  );
+  const fromVector = portVector(fromPort);
+  const toVector = portVector(toPort);
+  return {
+    cx1: fromPoint.x + fromVector.x * handle,
+    cy1: fromPoint.y + fromVector.y * handle,
+    cx2: toPoint.x + toVector.x * handle,
+    cy2: toPoint.y + toVector.y * handle,
+  };
+}
+
+function isAgentKind(kind: NetworkTileKind): boolean {
+  return kind === 'agent' || kind === 'root_agent';
+}
+
+function portAcceptsTile(kind: NetworkTileKind, port: TilePort, otherKind: NetworkTileKind): boolean {
+  if ((kind === 'work' || kind === 'browser') && port === 'left') {
+    return isAgentKind(otherKind);
+  }
+  return true;
+}
+
+function canConnectPorts(
+  state: AppStateTree,
+  fromTileId: string,
+  fromPort: TilePort,
+  toTileId: string,
+  toPort: TilePort,
+  ignoredConnectionKey?: string | null,
+): boolean {
+  if (fromTileId === toTileId) {
+    return false;
+  }
+
+  const fromKind = tileKindForTileId(state, fromTileId);
+  const toKind = tileKindForTileId(state, toTileId);
+  if (!fromKind || !toKind) {
+    return false;
+  }
+
+  if (connectionForPort(state, toTileId, toPort, ignoredConnectionKey)) {
+    return false;
+  }
+
+  const fromMode = portModeForTileKind(fromKind, fromPort);
+  const toMode = portModeForTileKind(toKind, toPort);
+  if (fromMode === 'read' && toMode === 'read') {
+    return false;
+  }
+
+  return portAcceptsTile(fromKind, fromPort, toKind) && portAcceptsTile(toKind, toPort, fromKind);
+}
+
+function worldPointToViewport(state: AppStateTree, point: Point): Point {
+  return {
+    x: point.x * state.ui.canvas.zoom + state.ui.canvas.panX,
+    y: point.y * state.ui.canvas.zoom + state.ui.canvas.panY,
+  };
+}
+
+function snappedNetworkTarget(
+  state: AppStateTree,
+  drag: NetworkDragState,
+  currentX: number,
+  currentY: number,
+): Pick<NetworkDragState, 'snappedTileId' | 'snappedPort' | 'snappedX' | 'snappedY'> {
+  const tileRects = activeSessionTileRects(state);
+  let best:
+    | {
+        tileId: string;
+        port: TilePort;
+        x: number;
+        y: number;
+        distance: number;
+      }
+    | null = null;
+
+  for (const [tileId, rect] of tileRects) {
+    if (tileId === drag.tileId) continue;
+    for (const port of ['left', 'top', 'right', 'bottom'] as TilePort[]) {
+      if (!canConnectPorts(state, drag.tileId, drag.port, tileId, port, drag.detachedConnectionKey)) {
+        continue;
+      }
+      const candidate = worldPointToViewport(state, portPoint(rect, port));
+      const distance = Math.hypot(candidate.x - currentX, candidate.y - currentY);
+      if (distance > NETWORK_SNAP_DISTANCE) {
+        continue;
+      }
+      if (!best || distance < best.distance) {
+        best = { tileId, port, x: candidate.x, y: candidate.y, distance };
+      }
+    }
+  }
+
+  if (!best) {
+    return {
+      snappedTileId: null,
+      snappedPort: null,
+      snappedX: null,
+      snappedY: null,
+    };
+  }
+
+  return {
+    snappedTileId: best.tileId,
+    snappedPort: best.port,
+    snappedX: best.x,
+    snappedY: best.y,
+  };
 }
 
 export function buildCanvasConnections(state: AppStateTree): CanvasConnection[] {
@@ -1626,6 +2763,7 @@ export function buildCanvasConnections(state: AppStateTree): CanvasConnection[] 
 
   const connections: CanvasConnection[] = [];
   for (const child of terminalsByWindowId.values()) {
+    if (child.parentWindowSource !== 'hook') continue;
     const parentWindowId = child.parentWindowId ?? null;
     if (!parentWindowId) continue;
     const parent = terminalsByWindowId.get(parentWindowId);
@@ -1700,6 +2838,199 @@ export function buildCanvasConnections(state: AppStateTree): CanvasConnection[] 
 }
 
 export const activeTabConnections = derived(appState, ($state) => buildCanvasConnections($state));
+export function buildRenderedNetworkConnections(state: AppStateTree): RenderedNetworkConnection[] {
+  const activeSessionId = state.tmux.activeSessionId;
+  if (!activeSessionId) return [];
+
+  const tileRects = activeSessionTileRects(state);
+
+  return state.network.connections
+    .filter((connection) => connection.session_id === activeSessionId)
+    .flatMap((connection) => {
+      const fromRect = tileRects.get(connection.from_tile_id);
+      const toRect = tileRects.get(connection.to_tile_id);
+      if (!fromRect || !toRect) {
+        return [];
+      }
+      const fromPoint = portPoint(fromRect, connection.from_port);
+      const toPoint = portPoint(toRect, connection.to_port);
+      const curve = buildConnectorCurve(fromPoint, connection.from_port, toPoint, connection.to_port);
+      return [{
+        fromTileId: connection.from_tile_id,
+        fromPort: connection.from_port,
+        toTileId: connection.to_tile_id,
+        toPort: connection.to_port,
+        x1: fromPoint.x,
+        y1: fromPoint.y,
+        x2: toPoint.x,
+        y2: toPoint.y,
+        cx1: curve.cx1,
+        cy1: curve.cy1,
+        cx2: curve.cx2,
+        cy2: curve.cy2,
+      }];
+    });
+}
+export const activeTabNetworkConnections = derived(appState, ($state) => buildRenderedNetworkConnections($state));
+export const visibleActiveTabNetworkConnections = derived(
+  [activeTabNetworkConnections, activeNetworkDrag, networkReleaseAnimation],
+  ([$connections, $drag, $release]) => {
+    const hidden = new Set<string>();
+    if ($drag?.detachedConnectionKey) {
+      hidden.add($drag.detachedConnectionKey);
+    }
+    if ($release?.connectionKey) {
+      hidden.add($release.connectionKey);
+    }
+    if (hidden.size === 0) {
+      return $connections;
+    }
+    return $connections.filter((connection) => !hidden.has(renderedNetworkConnectionKey(connection)));
+  },
+);
+
+export function portModeForTile(tileId: string, port: TilePort): PortMode {
+  const state = get(appState);
+  const kind = tileKindForTileId(state, tileId);
+  return portModeForTileKind(kind ?? 'shell', port);
+}
+
+export function portOccupied(tileId: string, port: TilePort): boolean {
+  return connectionForPort(get(appState), tileId, port) !== null;
+}
+
+export function beginNetworkPortDrag(tileId: string, port: TilePort, startX: number, startY: number) {
+  const state = get(appState);
+  const existingConnection = connectionForPort(state, tileId, port);
+  let anchorTileId = tileId;
+  let anchorPort = port;
+  let anchorX = startX;
+  let anchorY = startY;
+  let detachedConnectionKey: string | null = null;
+
+  if (existingConnection) {
+    const detachedEndpoint = oppositeConnectionEndpoint(existingConnection, tileId, port);
+    if (detachedEndpoint) {
+      anchorTileId = detachedEndpoint.tileId;
+      anchorPort = detachedEndpoint.port;
+      detachedConnectionKey = networkConnectionKey(existingConnection);
+      const anchorRect = activeSessionTileRects(state).get(anchorTileId);
+      if (anchorRect) {
+        const anchorPoint = worldPointToViewport(state, portPoint(anchorRect, anchorPort));
+        anchorX = anchorPoint.x;
+        anchorY = anchorPoint.y;
+      }
+    }
+  }
+
+  networkReleaseAnimation.set(null);
+  activeNetworkDrag.set({
+    tileId: anchorTileId,
+    port: anchorPort,
+    grabbedTileId: tileId,
+    grabbedPort: port,
+    startX: anchorX,
+    startY: anchorY,
+    currentX: startX,
+    currentY: startY,
+    startedOccupied: existingConnection !== null,
+    detachedConnectionKey,
+    snappedTileId: null,
+    snappedPort: null,
+    snappedX: null,
+    snappedY: null,
+  });
+}
+
+export function updateNetworkPortDrag(currentX: number, currentY: number) {
+  activeNetworkDrag.update((drag) => {
+    if (!drag) return drag;
+    const next = { ...drag, currentX, currentY };
+    return {
+      ...next,
+      ...snappedNetworkTarget(get(appState), next, currentX, currentY),
+    };
+  });
+}
+
+export async function disconnectTilePort(tileId: string, port: TilePort) {
+  const removed = await disconnectNetworkPort(tileId, port);
+  if (removed) {
+    appState.update((state) => removeNetworkConnectionFromState(state, networkConnectionKey(removed)));
+  }
+  return removed;
+}
+
+export async function cancelNetworkPortDrag(disconnectOccupied = false) {
+  const drag = get(activeNetworkDrag);
+  activeNetworkDrag.set(null);
+  if (disconnectOccupied && drag?.startedOccupied) {
+    networkReleaseAnimation.set(buildNetworkReleaseAnimation(drag));
+    await disconnectTilePort(drag.tileId, drag.port);
+  }
+}
+
+export async function completeNetworkPortDrag(targetTileId?: string, targetPort?: TilePort) {
+  const drag = get(activeNetworkDrag);
+  activeNetworkDrag.set(null);
+  if (!drag) return;
+
+  const resolvedTargetTileId = targetTileId ?? drag.snappedTileId ?? null;
+  const resolvedTargetPort = targetPort ?? drag.snappedPort ?? null;
+  const state = get(appState);
+  const validTarget =
+    Boolean(resolvedTargetTileId)
+    && Boolean(resolvedTargetPort)
+    && !(drag.tileId === resolvedTargetTileId && drag.port === resolvedTargetPort)
+    && canConnectPorts(
+      state,
+      drag.tileId,
+      drag.port,
+      resolvedTargetTileId as string,
+      resolvedTargetPort as TilePort,
+      drag.detachedConnectionKey,
+    );
+
+  if (!validTarget) {
+    if (drag.startedOccupied) {
+      networkReleaseAnimation.set(buildNetworkReleaseAnimation(drag));
+      try {
+        await disconnectTilePort(drag.tileId, drag.port);
+      } catch (error) {
+        networkReleaseAnimation.set(null);
+        console.error('network detach failed:', error);
+      }
+    }
+    return;
+  }
+
+  try {
+    if (drag.startedOccupied) {
+      await disconnectTilePort(drag.tileId, drag.port);
+    }
+    networkReleaseAnimation.set(null);
+    const connection = await connectNetworkTiles(
+      drag.tileId,
+      drag.port,
+      resolvedTargetTileId as string,
+      resolvedTargetPort as TilePort,
+    );
+    appState.update((nextState) => upsertNetworkConnectionInState(nextState, connection));
+  } catch (error) {
+    console.error('network drag failed:', error);
+  }
+}
+
+export const agentActivityByPaneId = derived(appState, ($state) => {
+  const record: Record<string, AgentActivityEntry[]> = {};
+  for (const paneId of Object.keys($state.tmux.panes)) {
+    const entries = buildAgentActivityEntries($state, paneId);
+    if (entries.length > 0) {
+      record[paneId] = entries;
+    }
+  }
+  return record;
+});
 
 function activeViewportWidth(viewportWidth?: number): number {
   return viewportWidth ?? window.innerWidth;
@@ -1715,6 +3046,14 @@ export function panCanvasBy(dx: number, dy: number) {
     panX: state.panX + dx,
     panY: state.panY + dy,
   }));
+}
+
+export function clientDeltaToWorldDelta(dx: number, dy: number, zoom: number) {
+  const safeZoom = Math.max(zoom, 0.01);
+  return {
+    dx: dx / safeZoom,
+    dy: dy / safeZoom,
+  };
 }
 
 export function zoomCanvasAtPoint(x: number, y: number, zoomFactor: number) {
@@ -1746,7 +3085,8 @@ export function wheelCanvas(deltaY: number, clientX: number, clientY: number) {
 
 export function fitCanvasToActiveTab(viewportWidth?: number, viewportHeight?: number) {
   const list = get(activeTabTerminals);
-  if (list.length === 0) return;
+  const workCards = get(activeTabWorkCards);
+  if (list.length === 0 && workCards.length === 0) return;
 
   let minX = Infinity;
   let minY = Infinity;
@@ -1757,6 +3097,12 @@ export function fitCanvasToActiveTab(viewportWidth?: number, viewportHeight?: nu
     minY = Math.min(minY, term.y);
     maxX = Math.max(maxX, term.x + term.width);
     maxY = Math.max(maxY, term.y + term.height);
+  }
+  for (const card of workCards) {
+    minX = Math.min(minX, card.x);
+    minY = Math.min(minY, card.y);
+    maxX = Math.max(maxX, card.x + card.width);
+    maxY = Math.max(maxY, card.y + card.height);
   }
 
   const viewW = activeViewportWidth(viewportWidth);
@@ -1781,7 +3127,48 @@ export function zoomCanvasToTile(paneId: string, viewportWidth?: number, viewpor
 }
 
 export function selectTile(paneId: string) {
-  selectedTerminalId.set(paneId);
+  appState.update((state) => ({
+    ...state,
+    ui: {
+      ...state.ui,
+      selectedPaneId: paneId,
+      selectedWorkId: null,
+      sidebarSection: isAgentPaneSelected({
+        ...state,
+        ui: { ...state.ui, selectedPaneId: paneId, selectedWorkId: null },
+      })
+        ? 'agents'
+        : 'tmux',
+    },
+  }));
+}
+
+export function selectWorkItem(workId: string) {
+  appState.update((state) => ({
+    ...state,
+    ui: {
+      ...state.ui,
+      selectedPaneId: null,
+      selectedWorkId: selectedWorkIdForSession(state, workId, true),
+      sidebarSection: 'work',
+    },
+  }));
+}
+
+export function selectAgentItem(agentId: string) {
+  appState.update((state) => {
+    const agent = state.agents[agentId];
+    if (!agent) return state;
+    return {
+      ...state,
+      ui: {
+        ...state.ui,
+        selectedPaneId: agent.tile_id,
+        selectedWorkId: null,
+        sidebarSection: 'agents',
+      },
+    };
+  });
 }
 
 export async function moveSelectedTerminalBy(dx: number, dy: number) {
@@ -1833,10 +3220,12 @@ export function buildTestDriverProjection(
     help_open: state.ui.helpOpen,
     sidebar: {
       open: state.ui.sidebarOpen,
+      section: state.ui.sidebarSection,
       selected_index: state.ui.sidebarSelectedIdx,
       items: buildSidebarItems(state),
     },
     close_tab_confirmation: state.ui.closeTabConfirmation,
+    close_pane_confirmation: state.ui.closePaneConfirmation,
     context_menu: state.ui.contextMenu
       ? {
         target: state.ui.contextMenu.target,
@@ -1853,6 +3242,23 @@ export function buildTestDriverProjection(
       }
       : null,
     selected_pane_id: state.ui.selectedPaneId,
+    selected_work_id: state.ui.selectedWorkId,
+    debug_tab: state.ui.debugTab,
+    agents: Object.values(state.agents),
+    topics: Object.values(state.topics),
+    chatter: state.chatter,
+    agent_logs: state.agentLogs,
+    agent_activity_by_pane: Object.fromEntries(
+      Object.keys(state.tmux.panes)
+        .map((paneId) => [paneId, buildAgentActivityEntries(state, paneId)])
+        .filter(([, entries]) => entries.length > 0),
+    ),
+    work_items: state.work.order
+      .map((workId) => state.work.items[workId])
+      .filter(
+        (item): item is WorkItem =>
+          Boolean(item) && (!state.tmux.activeSessionId || item.session_id === state.tmux.activeSessionId),
+      ),
     canvas: state.ui.canvas,
     tabs: state.tmux.sessionOrder
       .map((id) => state.tmux.sessions[id])
@@ -1881,6 +3287,10 @@ export function buildTestDriverProjection(
       cx2: connection.cx2,
       cy2: connection.cy2,
     })),
+    active_tab_network_connections: state.network.connections.filter(
+      (connection) => !state.tmux.activeSessionId || connection.session_id === state.tmux.activeSessionId,
+    ),
+    active_tab_work_cards: buildCanvasWorkCards(state),
     indicators: {
       tmux: status.tmux_server_alive,
       cc: status.control_client_alive,
@@ -1979,12 +3389,85 @@ export function updatePaneLayout(paneId: string, updates: Partial<LayoutEntry>) 
   });
 }
 
+export function updateWorkCardLayout(workId: string, updates: Partial<LayoutEntry>) {
+  const entryId = workLayoutKey(workId);
+  appState.update((state) => {
+    const entry = state.layout.entries[entryId];
+    if (!entry) return state;
+    return {
+      ...state,
+      layout: {
+        entries: {
+          ...state.layout.entries,
+          [entryId]: { ...entry, ...updates },
+        },
+      },
+    };
+  });
+}
+
+export async function applyRemoteLayoutEntry(
+  entryId: string,
+  entry: LayoutEntry,
+  paneId?: string | null,
+  requestResize = false,
+) {
+  appState.update((state) => ({
+    ...state,
+    layout: {
+      entries: {
+        ...state.layout.entries,
+        [entryId]: entry,
+      },
+    },
+  }));
+
+  if (!requestResize || !paneId) {
+    return;
+  }
+
+  await tick();
+  const handle = paneDriverHandles.get(paneId);
+  if (handle) {
+    await handle.syncViewport(true);
+  }
+}
+
 export async function persistPaneLayout(paneId: string) {
   const state = get(appState);
   const windowId = state.tmux.panes[paneId]?.window_id;
   const entry = windowId ? state.layout.entries[windowId] : null;
   if (!windowId || !entry) return;
   await saveLayoutState(windowId, entry.x, entry.y, entry.width, entry.height);
+}
+
+export async function persistWorkCardLayout(workId: string) {
+  const state = get(appState);
+  const entryId = workLayoutKey(workId);
+  const entry = state.layout.entries[entryId];
+  if (!entry) return;
+  await saveLayoutState(entryId, entry.x, entry.y, entry.width, entry.height);
+}
+
+export async function dragWorkCardBy(workId: string, dx: number, dy: number, persist = true) {
+  const state = get(appState);
+  const entry = state.layout.entries[workLayoutKey(workId)];
+  if (!entry) return;
+  updateWorkCardLayout(workId, { x: entry.x + dx, y: entry.y + dy });
+  if (persist) {
+    await persistWorkCardLayout(workId);
+  }
+}
+
+export async function deleteWorkCard(workId: string, sessionId: string) {
+  await deleteWorkItemCommand(workId);
+  appState.update((state) => ({
+    ...state,
+    layout: {
+      entries: removeWorkLayoutEntry(state.layout.entries, workId),
+    },
+  }));
+  await refreshWorkItems(sessionId);
 }
 
 export async function addTab(name?: string): Promise<Tab | null> {
@@ -2010,6 +3493,14 @@ export function setSidebarSelection(index: number) {
 
 export function moveSidebarSelection(delta: number) {
   void dispatchIntent({ type: 'move-sidebar-selection', delta });
+}
+
+export function setSidebarSection(section: SidebarSection) {
+  void dispatchIntent({ type: 'set-sidebar-section', section });
+}
+
+export function moveSidebarSection(delta: number) {
+  void dispatchIntent({ type: 'move-sidebar-section', delta });
 }
 
 export function openSidebar() {
@@ -2387,6 +3878,15 @@ export async function executeCommandBarCommand(command: string) {
     case 'new-tab':
       await addTab(action.name);
       break;
+    case 'dm':
+      await sendDirectMessageCommand(action.target, action.message);
+      break;
+    case 'cm':
+      await sendPublicMessageCommand(action.message);
+      break;
+    case 'sudo':
+      await sendRootMessageCommand(action.message);
+      break;
     case 'close-all': {
       const list = get(activeTabTerminals);
       for (const term of list) {
@@ -2457,6 +3957,15 @@ export function parseCommandBarCommand(command: string): CommandBarAction {
       return { type: 'fit-all' };
     case 'reset':
       return { type: 'intent', intent: { type: 'reset-canvas' } };
+    case 'dm': {
+      const target = parts[1];
+      const message = parts.slice(2).join(' ');
+      return target && message ? { type: 'dm', target, message } : { type: 'none' };
+    }
+    case 'cm':
+      return tail ? { type: 'cm', message: tail } : { type: 'none' };
+    case 'sudo':
+      return tail ? { type: 'sudo', message: tail } : { type: 'none' };
     default:
       return { type: 'none' };
   }

@@ -19,6 +19,7 @@ import {
   panCanvasBy,
   openCanvasContextMenu,
   openPaneContextMenu,
+  refreshWorkItems,
   removeTerminal,
   resizeTileTo,
   selectContextMenuItem,
@@ -30,7 +31,7 @@ import {
   zoomCanvasToTile,
 } from './stores/appState';
 import { handleGlobalKeyInput } from './interaction/keyboard';
-import { resolveTestDriverRequest, setTestDriverState, tmuxStatus } from './tauri';
+import { createWorkItem, resolveTestDriverRequest, setTestDriverState, tmuxStatus } from './tauri';
 import type { TestDriverProjection, TestDriverRequest, TestDriverStatus } from './types';
 
 interface TestDriverEventPayload {
@@ -126,6 +127,15 @@ async function executeRequest(request: TestDriverRequest): Promise<unknown> {
     case 'toolbar_spawn_shell':
       await dispatchIntent({ type: 'new-shell' });
       return null;
+    case 'toolbar_spawn_agent':
+      await dispatchIntent({ type: 'new-agent' });
+      return null;
+    case 'toolbar_spawn_work': {
+      const sessionId = get(appState).tmux.activeSessionId;
+      const item = await createWorkItem(request.title, sessionId ?? null);
+      await refreshWorkItems(item.session_id);
+      return item;
+    }
     case 'sidebar_open':
       openSidebar();
       return null;

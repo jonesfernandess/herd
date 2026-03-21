@@ -1,16 +1,20 @@
 use crate::{
+    agent::{now_ms, AgentChannelEvent, AgentChannelEventKind, AgentDebugState, AgentRole},
+    browser,
+    network::{self, NetworkConnection, NetworkTileDescriptor, NetworkTileKind},
     persist::TileState,
     runtime,
     state::AppState,
     tmux,
     tmux_state,
+    work,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ClaudeCommandDescriptor {
@@ -23,6 +27,13 @@ pub struct ClaudeCommandDescriptor {
 pub struct ClaudeMenuData {
     pub commands: Vec<ClaudeCommandDescriptor>,
     pub skills: Vec<ClaudeCommandDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BrowserWindowSpawn {
+    pub pane_id: String,
+    pub window_id: String,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -39,6 +50,153 @@ fn active_session_id(snapshot: &tmux_state::TmuxSnapshot) -> Result<String, Stri
         .clone()
         .or_else(|| snapshot.sessions.first().map(|session| session.id.clone()))
         .ok_or("no tmux session available".into())
+}
+
+fn active_or_last_session_id(state: &AppState) -> Result<String, String> {
+    if let Some(session_id) = state.last_active_session() {
+        return Ok(session_id);
+    }
+    active_session_id(&tmux_state::snapshot(state)?)
+}
+
+fn pane_network_tile_kind(
+    state: &AppState,
+    snapshot: &tmux_state::TmuxSnapshot,
+    pane_id: &str,
+) -> Result<NetworkTileKind, String> {
+    if let Some(agent) = state.agent_info_by_tile(pane_id)? {
+        return Ok(match agent.agent_role {
+            AgentRole::Root => NetworkTileKind::RootAgent,
+            AgentRole::Worker => NetworkTileKind::Agent,
+        });
+    }
+
+    let pane = snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.id == pane_id)
+        .ok_or_else(|| format!("unknown tmux pane: {pane_id}"))?;
+    let window_name = snapshot
+        .windows
+        .iter()
+        .find(|window| window.id == pane.window_id)
+        .map(|window| window.name.as_str())
+        .unwrap_or("");
+    if pane.title.eq_ignore_ascii_case("Browser") || window_name.eq_ignore_ascii_case("Browser") {
+        return Ok(NetworkTileKind::Browser);
+    }
+    Ok(NetworkTileKind::Shell)
+}
+
+fn resolve_ui_network_tile_descriptor(
+    state: &AppState,
+    snapshot: &tmux_state::TmuxSnapshot,
+    session_id: &str,
+    tile_id: &str,
+) -> Result<NetworkTileDescriptor, String> {
+    if let Some(work_id) = tile_id.strip_prefix("work:") {
+        let item = work::get_work_item_at(Path::new(runtime::database_path()), work_id)?;
+        if item.session_id != session_id {
+            return Err(format!("tile {tile_id} is not in session {session_id}"));
+        }
+        return Ok(NetworkTileDescriptor {
+            tile_id: tile_id.to_string(),
+            session_id: session_id.to_string(),
+            kind: NetworkTileKind::Work,
+        });
+    }
+
+    let pane = snapshot
+        .panes
+        .iter()
+        .find(|pane| pane.id == tile_id)
+        .ok_or_else(|| format!("unknown tile: {tile_id}"))?;
+    if pane.session_id != session_id {
+        return Err(format!("tile {tile_id} is not in session {session_id}"));
+    }
+    Ok(NetworkTileDescriptor {
+        tile_id: tile_id.to_string(),
+        session_id: session_id.to_string(),
+        kind: pane_network_tile_kind(state, snapshot, tile_id)?,
+    })
+}
+
+fn touched_work_ids_from_connections(connections: &[NetworkConnection]) -> Vec<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for connection in connections {
+        if let Some(work_id) = connection.from_tile_id.strip_prefix("work:") {
+            ids.insert(work_id.to_string());
+        }
+        if let Some(work_id) = connection.to_tile_id.strip_prefix("work:") {
+            ids.insert(work_id.to_string());
+        }
+    }
+    ids.into_iter().collect()
+}
+
+fn emit_agent_debug_state(app: &tauri::AppHandle, state: &AppState) {
+    let Ok(session_id) = active_or_last_session_id(state) else {
+        return;
+    };
+    if let Ok(snapshot) = state.snapshot_agent_debug_state_for_session(&session_id) {
+        let _ = app.emit("herd-agent-state", snapshot);
+    }
+}
+
+fn emit_work_updated(app: &tauri::AppHandle, item: &work::WorkItem) {
+    let _ = app.emit(
+        "herd-work-updated",
+        serde_json::json!({
+            "session_id": item.session_id,
+            "work_id": item.work_id,
+        }),
+    );
+}
+
+fn connection_event_message(connection: &NetworkConnection, connected: bool) -> String {
+    let action = if connected { "connected" } else { "disconnected" };
+    format!(
+        "Port {action}: {}:{} <-> {}:{}",
+        connection.from_tile_id,
+        connection.from_port.as_str(),
+        connection.to_tile_id,
+        connection.to_port.as_str(),
+    )
+}
+
+fn notify_agents_about_connection_change(
+    state: &AppState,
+    connection: &NetworkConnection,
+    connected: bool,
+) {
+    let message = connection_event_message(connection, connected);
+    for tile_id in [&connection.from_tile_id, &connection.to_tile_id] {
+        let Ok(Some(agent)) = state.agent_info_by_tile(tile_id) else {
+            continue;
+        };
+        if !agent.alive {
+            continue;
+        }
+        let event = AgentChannelEvent {
+            kind: AgentChannelEventKind::System,
+            from_agent_id: None,
+            from_display_name: "HERD".to_string(),
+            to_agent_id: Some(agent.agent_id.clone()),
+            to_display_name: Some(agent.display_name.clone()),
+            message: message.clone(),
+            topics: Vec::new(),
+            mentions: Vec::new(),
+            replay: false,
+            ping_id: None,
+            timestamp_ms: now_ms(),
+        };
+        if let Err(error) = state.send_event_to_agent(&agent.agent_id, event) {
+            log::warn!(
+                "Failed to deliver connection event to {} from Tauri command path: {error}",
+                agent.agent_id
+            );
+        }
+    }
 }
 
 fn active_window_id_for_session(
@@ -139,6 +297,311 @@ fn pane_current_path(pane_id: &str) -> Result<String, String> {
         return Err(format!("tmux returned an empty cwd for pane {pane_id}"));
     }
     Ok(cwd)
+}
+
+fn default_shell_program() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string())
+}
+
+fn build_shell_launch_command(cwd: &str) -> String {
+    format!(
+        "cd {} || exit 1\nexec {}",
+        shell_single_quote(cwd),
+        shell_single_quote(&default_shell_program())
+    )
+}
+
+fn agent_role_prompt_path(role: AgentRole) -> String {
+    let role_dir = match role {
+        AgentRole::Root => "root",
+        AgentRole::Worker => "worker",
+    };
+    runtime::project_root_dir()
+        .join(".claude/roles")
+        .join(role_dir)
+        .join("CLAUDE.md")
+        .to_string_lossy()
+        .to_string()
+}
+
+fn build_agent_launch_command(cwd: &str, pane_id: &str, server_name: &str, role: AgentRole) -> String {
+    let mcp_config = runtime::project_mcp_config_path()
+        .to_string_lossy()
+        .to_string();
+    let prompt_file = agent_role_prompt_path(role);
+    let tmux_server = runtime::tmux_server_name().to_string();
+    format!(
+        "(sleep 1; tmux -f /dev/null -L {} send-keys -t {} Enter >/dev/null 2>&1) &\ncd {} || exit 1\nHERD_ROLE_CLAUDE_MD={}\n[ -f \"$HERD_ROLE_CLAUDE_MD\" ] || {{ echo \"Missing role prompt file: $HERD_ROLE_CLAUDE_MD\"; exit 1; }}\nexec claude --append-system-prompt \"$(cat \"$HERD_ROLE_CLAUDE_MD\")\" --mcp-config {} --teammate-mode tmux --dangerously-load-development-channels server:{}",
+        shell_single_quote(&tmux_server),
+        shell_single_quote(pane_id),
+        shell_single_quote(cwd),
+        shell_single_quote(&prompt_file),
+        shell_single_quote(&mcp_config),
+        server_name,
+    )
+}
+
+fn build_claude_launch_command(cwd: &str, pane_id: &str) -> String {
+    build_agent_launch_command(cwd, pane_id, "herd", AgentRole::Worker)
+}
+
+fn build_root_agent_launch_command(cwd: &str, pane_id: &str) -> String {
+    build_agent_launch_command(cwd, pane_id, "herd", AgentRole::Root)
+}
+
+fn root_agent_id(session_id: &str) -> String {
+    format!("root:{session_id}")
+}
+
+pub fn respawn_root_agent_in_pane(
+    app: tauri::AppHandle,
+    session_id: String,
+    window_id: String,
+    pane_id: String,
+) -> Result<serde_json::Value, String> {
+    launch_agent_in_pane(
+        app,
+        session_id.clone(),
+        window_id,
+        pane_id,
+        root_agent_id(&session_id),
+        "Root",
+        AgentRole::Root,
+    )
+}
+
+fn launch_agent_in_pane(
+    app: tauri::AppHandle,
+    session_id: String,
+    window_id: String,
+    pane_id: String,
+    agent_id: String,
+    title: &str,
+    role: AgentRole,
+) -> Result<serde_json::Value, String> {
+    let cwd = tmux_state::ensure_session_root_cwd(&session_id)?;
+    let shell_command = match role {
+        AgentRole::Root => build_root_agent_launch_command(&cwd, &pane_id),
+        AgentRole::Worker => build_claude_launch_command(&cwd, &pane_id),
+    };
+
+    tmux::output(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        &pane_id,
+        "-e",
+        &format!("HERD_SOCK={}", runtime::socket_path()),
+        "-e",
+        &format!("HERD_AGENT_ID={agent_id}"),
+        "-e",
+        &format!("HERD_AGENT_ROLE={}", match role {
+            AgentRole::Root => "root",
+            AgentRole::Worker => "worker",
+        }),
+        "-e",
+        &format!("HERD_PANE_ID={pane_id}"),
+        "-e",
+        &format!("HERD_SESSION_ID={session_id}"),
+        "/bin/bash",
+        "-lc",
+        &shell_command,
+    ])
+    .map_err(|error| format!("tmux respawn-pane failed: {error}"))
+    .and_then(|output| {
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "tmux respawn-pane failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    })?;
+
+    let _ = set_pane_title(app.clone(), pane_id.clone(), title.to_string());
+    let _ = app.emit(
+        "shell-role",
+        serde_json::json!({
+            "session_id": pane_id,
+            "role": match role {
+                AgentRole::Root => "root_agent",
+                AgentRole::Worker => "claude",
+            },
+        }),
+    );
+    let _ = tmux_state::emit_snapshot(&app);
+
+    Ok(serde_json::json!({
+        "agent_id": agent_id,
+        "agent_type": "claude",
+        "agent_role": match role {
+            AgentRole::Root => "root",
+            AgentRole::Worker => "worker",
+        },
+        "pane_id": pane_id,
+        "window_id": window_id,
+        "session_id": session_id,
+        "cwd": cwd,
+    }))
+}
+
+fn session_primary_window_and_pane(
+    snapshot: &tmux_state::TmuxSnapshot,
+    session_id: &str,
+) -> Result<(String, String), String> {
+    let window_id = active_window_id_for_session(snapshot, session_id)?;
+    let pane_id = active_pane_id_for_window(snapshot, &window_id)?;
+    Ok((window_id, pane_id))
+}
+
+fn recorded_root_target_in_snapshot(
+    snapshot: &tmux_state::TmuxSnapshot,
+    info: &crate::agent::AgentInfo,
+) -> Option<(String, String)> {
+    let pane_exists = snapshot
+        .panes
+        .iter()
+        .any(|pane| pane.id == info.tile_id && pane.session_id == info.session_id && pane.window_id == info.window_id);
+    let window_exists = snapshot
+        .windows
+        .iter()
+        .any(|window| window.id == info.window_id && window.session_id == info.session_id);
+    if pane_exists && window_exists {
+        return Some((info.window_id.clone(), info.tile_id.clone()));
+    }
+    None
+}
+
+fn reusable_root_target_in_snapshot(
+    snapshot: &tmux_state::TmuxSnapshot,
+    info: &crate::agent::AgentInfo,
+    session_agents: &[crate::agent::AgentInfo],
+) -> Option<(String, String)> {
+    let target = recorded_root_target_in_snapshot(snapshot, info)?;
+    let occupied_by_other_live_agent = session_agents.iter().any(|agent| {
+        agent.tile_id == info.tile_id && agent.agent_id != info.agent_id && agent.alive
+    });
+    if occupied_by_other_live_agent {
+        return None;
+    }
+    Some(target)
+}
+
+fn duplicate_root_pane_ids_for_session(
+    snapshot: &tmux_state::TmuxSnapshot,
+    session_id: &str,
+    keep_pane_id: &str,
+) -> Vec<String> {
+    snapshot
+        .panes
+        .iter()
+        .filter(|pane| pane.session_id == session_id && pane.id != keep_pane_id && pane.title.trim() == "Root")
+        .map(|pane| pane.id.clone())
+        .collect()
+}
+
+fn prune_duplicate_root_panes(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    keep_pane_id: &str,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let snapshot = tmux_state::snapshot(state.inner())?;
+    let duplicate_pane_ids = duplicate_root_pane_ids_for_session(&snapshot, session_id, keep_pane_id);
+    if duplicate_pane_ids.is_empty() {
+        return Ok(());
+    }
+    for pane_id in duplicate_pane_ids {
+        if let Err(error) = tmux_state::kill_pane(&pane_id) {
+            log::warn!("Failed to prune duplicate root pane {pane_id} in session {session_id}: {error}");
+        }
+    }
+    let _ = tmux_state::emit_snapshot(app);
+    Ok(())
+}
+
+pub fn ensure_root_agent_for_session(
+    app: tauri::AppHandle,
+    session_id: String,
+    reuse_primary_pane: bool,
+) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let before = tmux_state::snapshot(state.inner())?;
+    let session_agents = state.list_agents_in_session(&session_id)?;
+    if let Some(info) = state.root_agent_in_session(&session_id)? {
+        if info.alive && reusable_root_target_in_snapshot(&before, &info, &session_agents).is_some() {
+            let _ = prune_duplicate_root_panes(&app, &session_id, &info.tile_id);
+            return Ok(serde_json::json!({
+                "agent_id": info.agent_id,
+                "agent_type": "claude",
+                "agent_role": "root",
+                "pane_id": info.tile_id,
+                "window_id": info.window_id,
+                "session_id": info.session_id,
+            }));
+        }
+    }
+    if let Some(info) = state.root_agent_in_session(&session_id)? {
+        if let Some((window_id, pane_id)) =
+            reusable_root_target_in_snapshot(&before, &info, &session_agents)
+        {
+            let launched = respawn_root_agent_in_pane(app.clone(), session_id.clone(), window_id, pane_id.clone())?;
+            let _ = prune_duplicate_root_panes(&app, &session_id, &pane_id);
+            return Ok(launched);
+        }
+    }
+    let (window_id, pane_id) = if reuse_primary_pane {
+        session_primary_window_and_pane(&before, &session_id)?
+    } else {
+        let window_id = new_window_detached(app.clone(), Some(session_id.clone()))?;
+        let after = tmux_state::snapshot(state.inner())?;
+        let pane_id = after
+            .windows
+            .iter()
+            .find(|window| window.id == window_id)
+            .and_then(|window| window.pane_ids.first().cloned())
+            .ok_or("tmux did not report a pane for the new Root window".to_string())?;
+        (window_id, pane_id)
+    };
+
+    let keep_pane_id = pane_id.clone();
+    let launched = launch_agent_in_pane(
+        app.clone(),
+        session_id.clone(),
+        window_id,
+        pane_id,
+        root_agent_id(&session_id),
+        "Root",
+        AgentRole::Root,
+    )?;
+    let _ = prune_duplicate_root_panes(&app, &session_id, &keep_pane_id);
+    Ok(launched)
+}
+
+pub fn repair_root_agent(
+    app: tauri::AppHandle,
+    info: &crate::agent::AgentInfo,
+) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let snapshot = tmux_state::snapshot(state.inner())?;
+    let session_agents = state.list_agents_in_session(&info.session_id)?;
+    if let Some((window_id, pane_id)) =
+        reusable_root_target_in_snapshot(&snapshot, info, &session_agents)
+    {
+        return respawn_root_agent_in_pane(
+            app,
+            info.session_id.clone(),
+            window_id,
+            pane_id,
+        );
+    }
+
+    ensure_root_agent_for_session(app, info.session_id.clone(), false)
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn builtin_claude_command(name: &str) -> Option<(&'static str, &'static str)> {
@@ -356,6 +819,189 @@ pub fn get_layout_state(
 }
 
 #[tauri::command]
+pub fn get_agent_debug_state(state: tauri::State<'_, AppState>) -> Result<AgentDebugState, String> {
+    let snapshot = tmux_state::snapshot(&state)?;
+    let session_id = active_session_id(&snapshot)?;
+    state.snapshot_agent_debug_state_for_session(&session_id)
+}
+
+#[tauri::command]
+pub fn get_work_items(
+    state: tauri::State<'_, AppState>,
+    session_id: Option<String>,
+) -> Result<Vec<work::WorkItem>, String> {
+    let resolved_session_id = if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+        session_id
+    } else {
+        active_session_id(&tmux_state::snapshot(&state)?)?
+    };
+    work::list_work_at(
+        Path::new(runtime::database_path()),
+        work::WorkListScope::CurrentSession(resolved_session_id),
+    )
+}
+
+#[tauri::command]
+pub fn send_root_message_command(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    message: String,
+) -> Result<(), String> {
+    crate::socket::server::send_root_message_as_user(state.inner(), &app, message)
+}
+
+#[tauri::command]
+pub fn send_direct_message_command(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    target: String,
+    message: String,
+) -> Result<(), String> {
+    crate::socket::server::send_direct_message_as_user(state.inner(), &app, target, message)
+}
+
+#[tauri::command]
+pub fn send_public_message_command(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    message: String,
+) -> Result<(), String> {
+    crate::socket::server::send_public_message_as_user(state.inner(), &app, message)
+}
+
+#[tauri::command]
+pub fn create_work_item(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    title: String,
+    session_id: Option<String>,
+) -> Result<work::WorkItem, String> {
+    let resolved_session_id = if let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) {
+        session_id
+    } else {
+        active_session_id(&tmux_state::snapshot(&state)?)?
+    };
+    let item = work::create_work_item_at(
+        Path::new(runtime::database_path()),
+        &runtime::project_root_dir(),
+        &resolved_session_id,
+        &title,
+    )?;
+    let _ = state.touch_topics_in_session(&item.session_id, std::slice::from_ref(&item.topic));
+    emit_agent_debug_state(&app, &state);
+    emit_work_updated(&app, &item);
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn delete_work_item(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    work_id: String,
+) -> Result<(), String> {
+    let item = work::get_work_item_at(Path::new(runtime::database_path()), &work_id)?;
+    let removed_connections = network::disconnect_all_for_tile_at(
+        Path::new(runtime::database_path()),
+        &item.session_id,
+        &format!("work:{work_id}"),
+    )
+    .unwrap_or_default();
+    work::delete_work_item_at(
+        Path::new(runtime::database_path()),
+        &runtime::project_root_dir(),
+        &work_id,
+    )?;
+    for connection in &removed_connections {
+        notify_agents_about_connection_change(state.inner(), connection, false);
+    }
+    state.remove_tile_state(&format!("work:{work_id}"));
+    state.save();
+    emit_agent_debug_state(&app, &state);
+    emit_work_updated(&app, &item);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn approve_work_item(app: tauri::AppHandle, work_id: String) -> Result<work::WorkItem, String> {
+    let item = work::approve_work_stage_at(Path::new(runtime::database_path()), &work_id)?;
+    emit_work_updated(&app, &item);
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn improve_work_item(
+    app: tauri::AppHandle,
+    work_id: String,
+    comment: String,
+) -> Result<work::WorkItem, String> {
+    let item = work::improve_work_stage_at(Path::new(runtime::database_path()), &work_id, &comment)?;
+    emit_work_updated(&app, &item);
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn read_work_stage_preview(work_id: String) -> Result<String, String> {
+    let item = work::get_work_item_at(Path::new(runtime::database_path()), &work_id)?;
+    let stage = item
+        .current_stage_state()
+        .ok_or_else(|| format!("missing current stage for {}", item.work_id))?;
+    fs::read_to_string(&stage.file_path)
+        .map_err(|error| format!("failed to read {}: {error}", stage.file_path))
+}
+
+#[tauri::command]
+pub fn connect_network_tiles(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    from_tile_id: String,
+    from_port: String,
+    to_tile_id: String,
+    to_port: String,
+) -> Result<network::NetworkConnection, String> {
+    let snapshot = tmux_state::snapshot(&state)?;
+    let session_id = active_session_id(&snapshot)?;
+    let from = resolve_ui_network_tile_descriptor(state.inner(), &snapshot, &session_id, &from_tile_id)?;
+    let to = resolve_ui_network_tile_descriptor(state.inner(), &snapshot, &session_id, &to_tile_id)?;
+    let from_port = network::parse_port(&from_port).map_err(|_| "invalid from_port".to_string())?;
+    let to_port = network::parse_port(&to_port).map_err(|_| "invalid to_port".to_string())?;
+    let connection = network::connect_at(Path::new(runtime::database_path()), &from, from_port, &to, to_port)?;
+    notify_agents_about_connection_change(state.inner(), &connection, true);
+    emit_agent_debug_state(&app, &state);
+    for work_id in touched_work_ids_from_connections(std::slice::from_ref(&connection)) {
+        if let Ok(item) = work::get_work_item_at(Path::new(runtime::database_path()), &work_id) {
+            emit_work_updated(&app, &item);
+        }
+    }
+    Ok(connection)
+}
+
+#[tauri::command]
+pub fn disconnect_network_port(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    tile_id: String,
+    port: String,
+) -> Result<Option<network::NetworkConnection>, String> {
+    let snapshot = tmux_state::snapshot(&state)?;
+    let session_id = active_session_id(&snapshot)?;
+    let descriptor = resolve_ui_network_tile_descriptor(state.inner(), &snapshot, &session_id, &tile_id)?;
+    let port = network::parse_port(&port).map_err(|_| "invalid port".to_string())?;
+    let removed = network::disconnect_at(Path::new(runtime::database_path()), &descriptor.session_id, &descriptor.tile_id, port)?;
+    if let Some(connection) = removed.as_ref() {
+        notify_agents_about_connection_change(state.inner(), connection, false);
+    }
+    emit_agent_debug_state(&app, &state);
+    if let Some(connection) = removed.as_ref() {
+        for work_id in touched_work_ids_from_connections(std::slice::from_ref(connection)) {
+            if let Ok(item) = work::get_work_item_at(Path::new(runtime::database_path()), &work_id) {
+                emit_work_updated(&app, &item);
+            }
+        }
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
 pub fn get_claude_menu_data_for_pane(
     state: tauri::State<'_, AppState>,
     pane_id: String,
@@ -388,6 +1034,7 @@ pub fn save_layout_state(
 pub fn new_session(app: tauri::AppHandle, name: Option<String>) -> Result<String, String> {
     let state = app.state::<AppState>();
     let session_id = tmux_state::create_session(name.as_deref())?;
+    let _ = ensure_root_agent_for_session(app.clone(), session_id.clone(), true)?;
     switch_control_client_to_session(state.inner(), &session_id)?;
     tmux_state::emit_snapshot(&app)?;
     Ok(session_id)
@@ -416,6 +1063,15 @@ pub fn kill_session(app: tauri::AppHandle, session_id: String) -> Result<(), Str
         }
     }
 
+    for pane_id in snapshot
+        .panes
+        .iter()
+        .filter(|pane| pane.session_id == session_id)
+        .map(|pane| pane.id.as_str())
+    {
+        browser::close_browser_webview(&app, pane_id);
+    }
+
     tmux_state::kill_session(&session_id)?;
     tmux_state::emit_snapshot(&app)?;
     Ok(())
@@ -436,6 +1092,35 @@ pub fn rename_session(app: tauri::AppHandle, session_id: String, name: String) -
     Ok(())
 }
 
+#[tauri::command]
+pub fn set_session_root_cwd(
+    app: tauri::AppHandle,
+    session_id: String,
+    cwd: String,
+) -> Result<String, String> {
+    let trimmed = cwd.trim();
+    if trimmed.is_empty() {
+        return Err("spawn directory cannot be empty".to_string());
+    }
+
+    let requested = PathBuf::from(trimmed);
+    let absolute = if requested.is_absolute() {
+        requested
+    } else {
+        runtime::project_root_dir().join(requested)
+    };
+    let canonical = fs::canonicalize(&absolute)
+        .map_err(|error| format!("failed to resolve spawn directory {}: {error}", absolute.display()))?;
+    if !canonical.is_dir() {
+        return Err(format!("spawn directory is not a directory: {}", canonical.display()));
+    }
+    let normalized = canonical.to_string_lossy().to_string();
+
+    tmux_state::set_session_root_cwd(&session_id, &normalized)?;
+    tmux_state::emit_snapshot(&app)?;
+    Ok(normalized)
+}
+
 fn new_window_internal(
     app: tauri::AppHandle,
     target_session_id: Option<String>,
@@ -454,6 +1139,9 @@ fn new_window_internal(
         .find(|pane| pane.id == pane_id)
         .map(|pane| pane.window_id.clone())
         .ok_or("tmux did not report the new window for the created pane")?;
+    let cwd = tmux_state::ensure_session_root_cwd(&session_id)?;
+
+    tmux_state::respawn_pane_shell_command(&pane_id, &build_shell_launch_command(&cwd))?;
 
     if select_new_window {
         tmux_state::select_window(&window_id)?;
@@ -469,6 +1157,86 @@ pub fn new_window(app: tauri::AppHandle, target_session_id: Option<String>) -> R
 
 pub fn new_window_detached(app: tauri::AppHandle, target_session_id: Option<String>) -> Result<String, String> {
     new_window_internal(app, target_session_id, false)
+}
+
+#[tauri::command]
+pub fn spawn_agent_window(
+    app: tauri::AppHandle,
+    target_session_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let before = tmux_state::snapshot(state.inner())?;
+    let session_id = target_session_id.unwrap_or(active_session_id(&before)?);
+    let window_id = new_window_detached(app.clone(), Some(session_id.clone()))?;
+    let after = tmux_state::snapshot(state.inner())?;
+    let pane_id = after
+        .windows
+        .iter()
+        .find(|window| window.id == window_id)
+        .and_then(|window| window.pane_ids.first().cloned())
+        .ok_or("tmux did not report a pane for the new Agent window".to_string())?;
+
+    let agent_id = uuid::Uuid::new_v4().to_string();
+    launch_agent_in_pane(
+        app,
+        session_id,
+        window_id,
+        pane_id,
+        agent_id,
+        "Agent",
+        AgentRole::Worker,
+    )
+}
+
+fn spawn_browser_window_internal(
+    app: tauri::AppHandle,
+    target_session_id: Option<String>,
+) -> Result<BrowserWindowSpawn, String> {
+    let state = app.state::<AppState>();
+    let before = tmux_state::snapshot(state.inner())?;
+    let session_id = target_session_id.unwrap_or(active_session_id(&before)?);
+    let window_id = new_window_detached(app.clone(), Some(session_id.clone()))?;
+    let after = tmux_state::snapshot(state.inner())?;
+    let pane_id = after
+        .windows
+        .iter()
+        .find(|window| window.id == window_id)
+        .and_then(|window| window.pane_ids.first().cloned())
+        .ok_or("tmux did not report a pane for the new Browser window".to_string())?;
+
+    let cwd = tmux_state::ensure_session_root_cwd(&session_id)?;
+    tmux_state::respawn_pane_shell_command(&pane_id, &build_shell_launch_command(&cwd))?;
+    let _ = tmux_state::rename_window(&window_id, "Browser");
+    let _ = set_pane_title(app.clone(), pane_id.clone(), "Browser".to_string());
+    let _ = app.emit(
+        "shell-role",
+        serde_json::json!({
+            "session_id": pane_id,
+            "role": "browser",
+        }),
+    );
+    let _ = tmux_state::emit_snapshot(&app);
+
+    Ok(BrowserWindowSpawn {
+        pane_id,
+        window_id,
+        session_id,
+    })
+}
+
+pub fn spawn_browser_window_with_pane(
+    app: tauri::AppHandle,
+    target_session_id: Option<String>,
+) -> Result<BrowserWindowSpawn, String> {
+    spawn_browser_window_internal(app, target_session_id)
+}
+
+#[tauri::command]
+pub fn spawn_browser_window(
+    app: tauri::AppHandle,
+    target_session_id: Option<String>,
+) -> Result<String, String> {
+    Ok(spawn_browser_window_internal(app, target_session_id)?.window_id)
 }
 
 #[tauri::command]
@@ -498,6 +1266,28 @@ pub fn kill_window(app: tauri::AppHandle, window_id: String) -> Result<(), Strin
         .find(|window| window.id == window_id)
         .cloned()
         .ok_or_else(|| format!("No tmux window found for {window_id}"))?;
+    let agents = state.list_agents_in_session(&window.session_id)?;
+    let root_agent = window
+        .pane_ids
+        .iter()
+        .find_map(|pane_id| {
+            agents
+                .iter()
+                .find(|agent| agent.agent_role == AgentRole::Root && agent.tile_id == *pane_id)
+                .cloned()
+        });
+    if let Some(root_agent) = root_agent {
+        let restarted = respawn_root_agent_in_pane(
+            app.clone(),
+            root_agent.session_id.clone(),
+            root_agent.window_id.clone(),
+            root_agent.tile_id.clone(),
+        )?;
+        let _ = tmux_state::emit_snapshot(&app);
+        let _ = prune_duplicate_root_panes(&app, &root_agent.session_id, &root_agent.tile_id);
+        let _ = restarted;
+        return Ok(());
+    }
     let session = snapshot
         .sessions
         .iter()
@@ -506,11 +1296,17 @@ pub fn kill_window(app: tauri::AppHandle, window_id: String) -> Result<(), Strin
         .ok_or_else(|| format!("No tmux session found for {}", window.session_id))?;
 
     if session.window_ids.len() <= 1 {
+        for pane_id in &window.pane_ids {
+            browser::close_browser_webview(&app, pane_id);
+        }
         tmux_state::respawn_window(&window_id)?;
         tmux_state::emit_snapshot(&app)?;
         return Ok(());
     }
 
+    for pane_id in &window.pane_ids {
+        browser::close_browser_webview(&app, pane_id);
+    }
     tmux_state::kill_window(&window_id)?;
     tmux_state::emit_snapshot(&app)?;
     Ok(())
@@ -520,13 +1316,13 @@ pub fn kill_window(app: tauri::AppHandle, window_id: String) -> Result<(), Strin
 pub fn kill_pane(app: tauri::AppHandle, pane_id: String) -> Result<(), String> {
     let state = app.state::<AppState>();
     let snapshot = tmux_state::snapshot(state.inner())?;
-    let window_id = snapshot
+    let pane = snapshot
         .panes
         .iter()
         .find(|pane| pane.id == pane_id)
-        .map(|pane| pane.window_id.clone())
+        .cloned()
         .ok_or_else(|| format!("No tmux pane found for {pane_id}"))?;
-    kill_window(app, window_id)
+    kill_window(app, pane.window_id)
 }
 
 #[tauri::command]
@@ -827,10 +1623,18 @@ pub fn tmux_status(state: tauri::State<'_, AppState>) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::{
+        build_claude_launch_command,
+        build_root_agent_launch_command,
+        build_shell_launch_command,
         control_client_tty_from_output,
+        duplicate_root_pane_ids_for_session,
         enrich_claude_commands,
+        recorded_root_target_in_snapshot,
+        reusable_root_target_in_snapshot,
         tmux_control_client_alive,
     };
+    use crate::agent::{AgentInfo, AgentRole, AgentType};
+    use crate::tmux_state::{TmuxPane, TmuxSession, TmuxSnapshot, TmuxWindow};
     use std::fs;
     use std::path::PathBuf;
 
@@ -861,6 +1665,80 @@ mod tests {
         })
     }
 
+    fn sample_snapshot() -> TmuxSnapshot {
+        TmuxSnapshot {
+            version: 1,
+            server_name: "herd".to_string(),
+            active_session_id: Some("$1".to_string()),
+            active_window_id: Some("@1".to_string()),
+            active_pane_id: Some("%1".to_string()),
+            sessions: vec![TmuxSession {
+                id: "$1".to_string(),
+                name: "Main".to_string(),
+                active: true,
+                window_ids: vec!["@1".to_string(), "@2".to_string()],
+                active_window_id: Some("@1".to_string()),
+                root_cwd: Some("/tmp/herd".to_string()),
+            }],
+            windows: vec![
+                TmuxWindow {
+                    id: "@1".to_string(),
+                    session_id: "$1".to_string(),
+                    session_name: "Main".to_string(),
+                    index: 0,
+                    name: "Root".to_string(),
+                    active: true,
+                    cols: 80,
+                    rows: 24,
+                    pane_ids: vec!["%1".to_string()],
+                    parent_window_id: None,
+                    parent_window_source: None,
+                },
+                TmuxWindow {
+                    id: "@2".to_string(),
+                    session_id: "$1".to_string(),
+                    session_name: "Main".to_string(),
+                    index: 1,
+                    name: "Root".to_string(),
+                    active: false,
+                    cols: 80,
+                    rows: 24,
+                    pane_ids: vec!["%2".to_string()],
+                    parent_window_id: None,
+                    parent_window_source: None,
+                },
+            ],
+            panes: vec![
+                TmuxPane {
+                    id: "%1".to_string(),
+                    session_id: "$1".to_string(),
+                    window_id: "@1".to_string(),
+                    window_index: 0,
+                    pane_index: 0,
+                    cols: 80,
+                    rows: 24,
+                    title: "Root".to_string(),
+                    command: "bash".to_string(),
+                    active: true,
+                    dead: false,
+                },
+                TmuxPane {
+                    id: "%2".to_string(),
+                    session_id: "$1".to_string(),
+                    window_id: "@2".to_string(),
+                    window_index: 1,
+                    pane_index: 0,
+                    cols: 80,
+                    rows: 24,
+                    title: "Root".to_string(),
+                    command: "bash".to_string(),
+                    active: false,
+                    dead: false,
+                },
+            ],
+        }
+    }
+
     #[test]
     fn matches_the_tracked_control_client() {
         let output = "92568\t1\n91234\t0\n";
@@ -885,6 +1763,77 @@ mod tests {
         assert_eq!(control_client_tty_from_output(output, Some(91234)), None);
         assert_eq!(control_client_tty_from_output(output, Some(99999)), None);
         assert_eq!(control_client_tty_from_output(output, None), None);
+    }
+
+    #[test]
+    fn reuses_a_recorded_root_pane_when_it_still_exists_in_tmux() {
+        let snapshot = sample_snapshot();
+        let info = AgentInfo {
+            agent_id: "root:$1".to_string(),
+            agent_type: AgentType::Claude,
+            agent_role: AgentRole::Root,
+            tile_id: "%1".to_string(),
+            window_id: "@1".to_string(),
+            session_id: "$1".to_string(),
+            title: "Root".to_string(),
+            display_name: "Root".to_string(),
+            alive: false,
+            chatter_subscribed: true,
+            topics: Vec::new(),
+            agent_pid: None,
+        };
+
+        assert_eq!(
+            recorded_root_target_in_snapshot(&snapshot, &info),
+            Some(("@1".to_string(), "%1".to_string()))
+        );
+    }
+
+    #[test]
+    fn identifies_duplicate_root_panes_to_prune_within_a_session() {
+        let snapshot = sample_snapshot();
+        assert_eq!(
+            duplicate_root_pane_ids_for_session(&snapshot, "$1", "%1"),
+            vec!["%2".to_string()]
+        );
+    }
+
+    #[test]
+    fn does_not_reuse_a_recorded_root_pane_when_a_live_worker_occupies_it() {
+        let snapshot = sample_snapshot();
+        let root = AgentInfo {
+            agent_id: "root:$1".to_string(),
+            agent_type: AgentType::Claude,
+            agent_role: AgentRole::Root,
+            tile_id: "%1".to_string(),
+            window_id: "@1".to_string(),
+            session_id: "$1".to_string(),
+            title: "Root".to_string(),
+            display_name: "Root".to_string(),
+            alive: false,
+            chatter_subscribed: true,
+            topics: Vec::new(),
+            agent_pid: None,
+        };
+        let worker = AgentInfo {
+            agent_id: "worker-1".to_string(),
+            agent_type: AgentType::Claude,
+            agent_role: AgentRole::Worker,
+            tile_id: "%1".to_string(),
+            window_id: "@1".to_string(),
+            session_id: "$1".to_string(),
+            title: "Agent".to_string(),
+            display_name: "Agent 1".to_string(),
+            alive: true,
+            chatter_subscribed: true,
+            topics: Vec::new(),
+            agent_pid: None,
+        };
+
+        assert_eq!(
+            reusable_root_target_in_snapshot(&snapshot, &root, &[root.clone(), worker]),
+            None
+        );
     }
 
     #[test]
@@ -928,5 +1877,38 @@ mod tests {
         assert_eq!(commands[0].source, "custom");
 
         let _ = fs::remove_dir_all(cwd);
+    }
+
+    #[test]
+    fn shell_launch_command_starts_in_the_requested_directory() {
+        let command = build_shell_launch_command("/tmp/herd-shell");
+        assert!(command.contains("cd '/tmp/herd-shell' || exit 1"));
+        assert!(command.contains("exec "));
+    }
+
+    #[test]
+    fn worker_agent_launch_command_uses_worker_mcp_server() {
+        let command = build_claude_launch_command("/tmp/herd-claude", "%12");
+        assert!(command.contains("cd '/tmp/herd-claude' || exit 1"));
+        assert!(command.contains("HERD_ROLE_CLAUDE_MD="));
+        assert!(command.contains(".claude/roles/worker/CLAUDE.md"));
+        assert!(command.contains("--append-system-prompt \"$(cat \"$HERD_ROLE_CLAUDE_MD\")\""));
+        assert!(command.contains("--mcp-config "));
+        assert!(command.contains("send-keys -t '%12' Enter"));
+        assert!(command.contains("--dangerously-load-development-channels server:herd"));
+        assert!(!command.contains("--channels server:herd"));
+    }
+
+    #[test]
+    fn root_agent_launch_command_uses_root_mcp_server() {
+        let command = build_root_agent_launch_command("/tmp/herd-root", "%21");
+        assert!(command.contains("cd '/tmp/herd-root' || exit 1"));
+        assert!(command.contains("HERD_ROLE_CLAUDE_MD="));
+        assert!(command.contains(".claude/roles/root/CLAUDE.md"));
+        assert!(command.contains("--append-system-prompt \"$(cat \"$HERD_ROLE_CLAUDE_MD\")\""));
+        assert!(command.contains("--mcp-config "));
+        assert!(command.contains("send-keys -t '%21' Enter"));
+        assert!(command.contains("--dangerously-load-development-channels server:herd"));
+        assert!(!command.contains("--dangerously-load-development-channels server:herd-root"));
     }
 }

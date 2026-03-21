@@ -3,9 +3,13 @@
   import { listen, type UnlistenFn } from '@tauri-apps/api/event';
   import { FitAddon } from '@xterm/addon-fit';
   import { Terminal } from '@xterm/xterm';
+  import TilePorts from './TilePorts.svelte';
   import { readPaneOutput } from './tauri';
   import type { TerminalInfo, PtyOutputEvent } from './types';
   import {
+    agentActivityByPaneId,
+    canvasState,
+    clientDeltaToWorldDelta,
     mode,
     openPaneContextMenu,
     persistPaneLayout,
@@ -33,10 +37,21 @@
   let syncFrame: number | null = null;
   let lastViewportKey = '';
   let unregisterDriverHandle: (() => void) | null = null;
+  let activityBodyRef = $state<HTMLDivElement>();
 
   let isSelected = $derived($selectedTerminalId === info.id);
   let designator = $derived(`P${info.id.replace(/\D/g, '') || info.paneId.replace(/\D/g, '')}`);
   let displayTitle = $derived(info.title !== 'shell' ? info.title : designator);
+  let activityEntries = $derived($agentActivityByPaneId[info.paneId] ?? []);
+  let isRootAgentTile = $derived(info.kind === 'root_agent');
+  let isAgentTile = $derived(isRootAgentTile || info.kind === 'claude' || activityEntries.length > 0);
+  let isBrowserTile = $derived(info.kind === 'browser');
+  let canClose = $derived(true);
+  let closeLabel = $derived(isRootAgentTile ? 'Close Root Agent' : 'Close Shell');
+  let componentTypeLabel = $derived(
+    isRootAgentTile ? 'ROOT' : info.readOnly ? 'VIEW' : info.kind === 'browser' ? 'WEB' : 'TTY',
+  );
+  let activityCollapsed = $state(false);
 
   let isDragging = false;
   let dragStartX = 0;
@@ -55,6 +70,12 @@
     const normalized = nextTextarea instanceof HTMLTextAreaElement ? nextTextarea : null;
     if (normalized === helperTextarea) return;
     helperTextarea = normalized;
+  }
+
+  function scrollActivityToBottom() {
+    requestAnimationFrame(() => {
+      if (activityBodyRef) activityBodyRef.scrollTop = activityBodyRef.scrollHeight;
+    });
   }
 
   onMount(async () => {
@@ -193,6 +214,16 @@
     }
   });
 
+  $effect(() => {
+    activityCollapsed;
+    activityEntries.length;
+    info.width;
+    info.height;
+    if (isAgentTile && !activityCollapsed) {
+      scrollActivityToBottom();
+    }
+  });
+
   function handleTitleDblClick(e: MouseEvent) {
     zoomCanvasToTile(info.paneId, window.innerWidth, window.innerHeight - 32);
     e.stopPropagation();
@@ -222,12 +253,18 @@
 
   function handleWindowMouseMove(e: MouseEvent) {
     if (isDragging) {
-      const dx = e.clientX - dragStartX;
-      const dy = e.clientY - dragStartY;
+      const { dx, dy } = clientDeltaToWorldDelta(
+        e.clientX - dragStartX,
+        e.clientY - dragStartY,
+        $canvasState.zoom,
+      );
       updateTerminal(info.id, { x: origX + dx, y: origY + dy });
     } else if (isResizing) {
-      const dx = e.clientX - resizeStartX;
-      const dy = e.clientY - resizeStartY;
+      const { dx, dy } = clientDeltaToWorldDelta(
+        e.clientX - resizeStartX,
+        e.clientY - resizeStartY,
+        $canvasState.zoom,
+      );
       updateTerminal(info.id, {
         width: Math.max(300, origW + dx),
         height: Math.max(200, origH + dy),
@@ -273,6 +310,9 @@
 <div
   class="pcb-component"
   class:selected={isSelected}
+  class:kind-agent={isAgentTile}
+  class:kind-root-agent={isRootAgentTile}
+  class:kind-browser={isBrowserTile}
   style="left: {info.x}px; top: {info.y}px; width: {info.width}px; height: {info.height}px; z-index: {isSelected ? 10 : 1};"
   onmousedown={(e) => {
     selectTile(info.id);
@@ -283,20 +323,30 @@
   }}
   oncontextmenu={handleContextMenu}
 >
+  <TilePorts tileId={info.paneId} />
   <div class="component-body">
     <div class="ic-notch"></div>
 
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="header-bar" onmousedown={handleTitleMouseDown} ondblclick={handleTitleDblClick}>
       <div class="header-left">
+        {#if isAgentTile}
+          <span class="agent-badge" class:root-agent-badge={isRootAgentTile} title={isRootAgentTile ? 'Root agent tile' : 'Agent tile'} aria-label={isRootAgentTile ? 'Root agent tile' : 'Agent tile'}>
+            {isRootAgentTile ? 'ROOT' : 'CC'}
+          </span>
+        {:else if isBrowserTile}
+          <span class="browser-badge" title="Browser tile" aria-label="Browser tile">WEB</span>
+        {/if}
         <span class="designator">{displayTitle}</span>
-        <span class="component-type">{info.readOnly ? 'VIEW' : 'TTY'}</span>
+        <span class="component-type">{componentTypeLabel}</span>
       </div>
       <div class="header-right">
         <span class="coord-info">{Math.round(info.x)},{Math.round(info.y)}</span>
-        <button class="close-btn" onclick={handleClose}>
-          <span class="close-x">×</span>
-        </button>
+        {#if canClose}
+          <button class="close-btn" onclick={handleClose} title={closeLabel} aria-label={closeLabel}>
+            <span class="close-x">×</span>
+          </button>
+        {/if}
       </div>
     </div>
 
@@ -307,6 +357,37 @@
       <div class="phosphor-glow"></div>
       <div class="input-shield" class:pass-through={$mode === 'input'}></div>
     </div>
+
+    {#if isAgentTile}
+      <div class="agent-activity" class:collapsed={activityCollapsed}>
+        <div class="activity-header">
+          <span>Activity</span>
+          <button
+            class="activity-toggle"
+            type="button"
+            title={activityCollapsed ? 'Expand activity' : 'Collapse activity'}
+            aria-label={activityCollapsed ? 'Expand activity' : 'Collapse activity'}
+            onclick={(event) => {
+              event.stopPropagation();
+              activityCollapsed = !activityCollapsed;
+            }}
+          >
+            {activityCollapsed ? '+' : '−'}
+          </button>
+        </div>
+        {#if !activityCollapsed}
+          <div class="activity-body" bind:this={activityBodyRef}>
+            {#if activityEntries.length === 0}
+              <div class="activity-line empty">No agent traffic yet</div>
+            {:else}
+              {#each activityEntries as entry, index (`${entry.timestamp_ms}:${index}`)}
+                <div class="activity-line">{entry.text}</div>
+              {/each}
+            {/if}
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     <div class="info-strip">
       <span class="info-item">
@@ -335,14 +416,55 @@
     display: flex;
     align-items: stretch;
     filter: drop-shadow(0 2px 8px rgba(0, 0, 0, 0.6));
+    --tile-port-contour: var(--component-border);
   }
 
   .pcb-component.selected {
     filter: drop-shadow(0 0 6px rgba(51, 255, 51, 0.3));
+    --tile-port-contour: var(--phosphor-green-dim);
+  }
+
+  .pcb-component.kind-agent {
+    --tile-port-contour: rgba(242, 176, 90, 0.34);
+  }
+
+  .pcb-component.kind-root-agent {
+    --tile-port-contour: rgba(255, 92, 92, 0.4);
+  }
+
+  .pcb-component.kind-browser {
+    --tile-port-contour: rgba(102, 225, 255, 0.34);
   }
 
   .pcb-component.selected .component-body {
     border-color: var(--phosphor-green-dim);
+  }
+
+  .pcb-component.kind-agent.selected {
+    filter: drop-shadow(0 0 8px rgba(242, 176, 90, 0.28));
+    --tile-port-contour: rgba(242, 176, 90, 0.5);
+  }
+
+  .pcb-component.kind-agent.selected .component-body {
+    border-color: rgba(242, 176, 90, 0.5);
+  }
+
+  .pcb-component.kind-root-agent.selected {
+    filter: drop-shadow(0 0 8px rgba(255, 92, 92, 0.3));
+    --tile-port-contour: rgba(255, 92, 92, 0.52);
+  }
+
+  .pcb-component.kind-root-agent.selected .component-body {
+    border-color: rgba(255, 92, 92, 0.52);
+  }
+
+  .pcb-component.kind-browser.selected {
+    filter: drop-shadow(0 0 8px rgba(102, 225, 255, 0.28));
+    --tile-port-contour: rgba(102, 225, 255, 0.5);
+  }
+
+  .pcb-component.kind-browser.selected .component-body {
+    border-color: rgba(102, 225, 255, 0.5);
   }
 
   .component-body {
@@ -353,6 +475,18 @@
     border: 1px solid var(--component-border);
     position: relative;
     min-width: 0;
+  }
+
+  .pcb-component.kind-agent .component-body {
+    border-color: rgba(242, 176, 90, 0.34);
+  }
+
+  .pcb-component.kind-root-agent .component-body {
+    border-color: rgba(255, 92, 92, 0.4);
+  }
+
+  .pcb-component.kind-browser .component-body {
+    border-color: rgba(102, 225, 255, 0.34);
   }
 
   .ic-notch {
@@ -382,6 +516,21 @@
     flex-shrink: 0;
   }
 
+  .pcb-component.kind-agent .header-bar {
+    background: linear-gradient(180deg, rgba(52, 35, 14, 0.9), rgba(34, 24, 10, 0.92));
+    border-bottom-color: rgba(242, 176, 90, 0.34);
+  }
+
+  .pcb-component.kind-root-agent .header-bar {
+    background: linear-gradient(180deg, rgba(60, 18, 18, 0.92), rgba(34, 11, 11, 0.94));
+    border-bottom-color: rgba(255, 92, 92, 0.4);
+  }
+
+  .pcb-component.kind-browser .header-bar {
+    background: linear-gradient(180deg, rgba(12, 36, 44, 0.9), rgba(9, 25, 31, 0.92));
+    border-bottom-color: rgba(102, 225, 255, 0.34);
+  }
+
   .header-left, .header-right {
     display: flex;
     align-items: center;
@@ -392,6 +541,51 @@
     font-size: 11px;
     color: var(--silk-white);
     letter-spacing: 1px;
+  }
+
+  .agent-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 18px;
+    height: 14px;
+    padding: 0 4px;
+    border: 1px solid rgba(242, 176, 90, 0.35);
+    border-radius: 3px;
+    background: rgba(242, 176, 90, 0.08);
+    color: var(--copper);
+    font-family: var(--font-mono);
+    font-size: 8px;
+    letter-spacing: 0.6px;
+    line-height: 1;
+    text-transform: uppercase;
+    box-shadow: inset 0 0 8px rgba(242, 176, 90, 0.05);
+  }
+
+  .root-agent-badge {
+    border-color: rgba(255, 92, 92, 0.38);
+    background: rgba(255, 92, 92, 0.12);
+    color: #ff7b7b;
+    box-shadow: inset 0 0 8px rgba(255, 92, 92, 0.08);
+  }
+
+  .browser-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 24px;
+    height: 14px;
+    padding: 0 4px;
+    border: 1px solid rgba(102, 225, 255, 0.35);
+    border-radius: 3px;
+    background: rgba(102, 225, 255, 0.08);
+    color: #66e1ff;
+    font-family: var(--font-mono);
+    font-size: 8px;
+    letter-spacing: 0.6px;
+    line-height: 1;
+    text-transform: uppercase;
+    box-shadow: inset 0 0 8px rgba(102, 225, 255, 0.05);
   }
 
   .component-type {
@@ -476,6 +670,70 @@
     justify-content: space-between;
     flex-shrink: 0;
     background: rgba(0, 0, 0, 0.2);
+  }
+
+  .agent-activity {
+    flex: 0 0 96px;
+    min-height: 0;
+    margin: 0 8px 6px;
+    border: 1px solid rgba(242, 176, 90, 0.22);
+    background: rgba(8, 14, 8, 0.95);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .agent-activity.collapsed {
+    flex: 0 0 auto;
+  }
+
+  .activity-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 6px;
+    color: var(--copper);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.7px;
+    text-transform: uppercase;
+    border-bottom: 1px solid rgba(242, 176, 90, 0.18);
+  }
+
+  .activity-toggle {
+    width: 16px;
+    height: 16px;
+    border: 1px solid rgba(242, 176, 90, 0.22);
+    background: rgba(0, 0, 0, 0.18);
+    color: var(--copper);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+  }
+
+  .activity-toggle:hover {
+    border-color: var(--copper);
+    background: rgba(242, 176, 90, 0.08);
+  }
+
+  .activity-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 4px 6px 6px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    line-height: 1.45;
+  }
+
+  .activity-line {
+    color: var(--silk-dim);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .activity-line.empty {
+    color: var(--copper-dim);
   }
 
   .info-item {

@@ -2,12 +2,19 @@ import net from 'node:net';
 import readline from 'node:readline';
 
 import type {
+  AgentInfo,
   AppStateTree,
+  NetworkConnection,
   PaneKind,
+  SessionTileInfo,
+  TileGraph,
+  TileTypeFilter,
   TestDriverKey,
   TestDriverProjection,
   TestDriverRequest,
   TestDriverStatus,
+  TopicInfo,
+  WorkItem,
 } from '../../src/lib/types';
 
 interface SocketResponse<T = unknown> {
@@ -128,6 +135,14 @@ export class HerdTestClient {
     await this.testDriver({ type: 'toolbar_spawn_shell' });
   }
 
+  async toolbarSpawnAgent() {
+    await this.testDriver({ type: 'toolbar_spawn_agent' });
+  }
+
+  async toolbarSpawnWork(title: string) {
+    return this.testDriver<WorkItem>({ type: 'toolbar_spawn_work', title });
+  }
+
   async sidebarOpen() {
     await this.testDriver({ type: 'sidebar_open' });
   }
@@ -218,19 +233,273 @@ export class HerdTestClient {
   }
 
   async listShells(): Promise<Array<Record<string, unknown>>> {
-    return this.sendCommand({ command: 'list_shells' });
+    return this.sendCommand({ command: 'shell_list' });
   }
 
   async readOutput(sessionId: string): Promise<{ output: string }> {
-    return this.sendCommand({ command: 'read_output', session_id: sessionId });
+    return this.sendCommand({ command: 'shell_output_read', session_id: sessionId });
   }
 
   async execInShell(sessionId: string, shellCommand: string): Promise<void> {
-    await this.sendCommand({ command: 'exec_in_shell', session_id: sessionId, shell_command: shellCommand });
+    await this.sendCommand({ command: 'shell_exec', session_id: sessionId, shell_command: shellCommand });
   }
 
   async setTileRole(sessionId: string, role: PaneKind): Promise<void> {
-    await this.sendCommand({ command: 'set_tile_role', session_id: sessionId, role });
+    await this.sendCommand({ command: 'shell_role_set', session_id: sessionId, role });
+  }
+
+  async listAgents(senderPaneId?: string | null): Promise<AgentInfo[]> {
+    return this.sendCommand({
+      command: 'agent_list',
+      sender_pane_id: senderPaneId ?? null,
+    });
+  }
+
+  async listTopics(senderPaneId?: string | null): Promise<TopicInfo[]> {
+    return this.sendCommand({
+      command: 'topics_list',
+      sender_pane_id: senderPaneId ?? null,
+    });
+  }
+
+  async agentRegister(
+    agentId: string,
+    paneId: string,
+    title = 'Agent',
+    agentRole: 'worker' | 'root' = 'worker',
+  ): Promise<{ agent: AgentInfo }> {
+    return this.sendCommand({
+      command: 'agent_register',
+      agent_id: agentId,
+      agent_type: 'claude',
+      agent_role: agentRole,
+      pane_id: paneId,
+      title,
+    });
+  }
+
+  async agentPingAck(agentId: string): Promise<{ agent: AgentInfo }> {
+    return this.sendCommand({
+      command: 'agent_ping_ack',
+      agent_id: agentId,
+    });
+  }
+
+  async messageDirect(toAgentId: string, message: string, senderPaneId?: string | null): Promise<void> {
+    await this.sendCommand({
+      command: 'message_direct',
+      to_agent_id: toAgentId,
+      message,
+      sender_pane_id: senderPaneId ?? null,
+    });
+  }
+
+  async messagePublic(message: string, senderPaneId?: string | null, topics?: string[], mentions?: string[]): Promise<void> {
+    await this.sendCommand({
+      command: 'message_public',
+      message,
+      sender_pane_id: senderPaneId ?? null,
+      topics: topics ?? [],
+      mentions: mentions ?? [],
+    });
+  }
+
+  async messageChatter(message: string, senderPaneId?: string | null, topics?: string[], mentions?: string[]): Promise<void> {
+    await this.messagePublic(message, senderPaneId, topics, mentions);
+  }
+
+  async messageNetwork(message: string, senderPaneId?: string | null, senderAgentId?: string | null): Promise<void> {
+    await this.sendCommand({
+      command: 'message_network',
+      message,
+      sender_pane_id: senderPaneId ?? null,
+      sender_agent_id: senderAgentId ?? null,
+    });
+  }
+
+  async messageRoot(message: string, senderPaneId?: string | null, senderAgentId?: string | null): Promise<void> {
+    await this.sendCommand({
+      command: 'message_root',
+      message,
+      sender_pane_id: senderPaneId ?? null,
+      sender_agent_id: senderAgentId ?? null,
+    });
+  }
+
+  async listNetwork(
+    senderPaneId?: string | null,
+    senderAgentId?: string | null,
+    tileType?: TileTypeFilter | null,
+  ): Promise<TileGraph> {
+    return this.sendCommand({
+      command: 'network_list',
+      sender_pane_id: senderPaneId ?? null,
+      sender_agent_id: senderAgentId ?? null,
+      tile_type: tileType ?? null,
+    });
+  }
+
+  async sessionList(
+    senderPaneId?: string | null,
+    senderAgentId?: string | null,
+    tileType?: TileTypeFilter | null,
+  ): Promise<TileGraph> {
+    return this.sendCommand({
+      command: 'session_list',
+      sender_pane_id: senderPaneId ?? null,
+      sender_agent_id: senderAgentId ?? null,
+      tile_type: tileType ?? null,
+    });
+  }
+
+  async tileList(
+    senderPaneId?: string | null,
+    senderAgentId?: string | null,
+    tileType?: TileTypeFilter | null,
+  ): Promise<SessionTileInfo[]> {
+    return this.sendCommand({
+      command: 'tile_list',
+      sender_pane_id: senderPaneId ?? null,
+      sender_agent_id: senderAgentId ?? null,
+      tile_type: tileType ?? null,
+    });
+  }
+
+  async tileGet(
+    tileId: string,
+    senderPaneId?: string | null,
+    senderAgentId?: string | null,
+  ): Promise<SessionTileInfo> {
+    return this.sendCommand({
+      command: 'tile_get',
+      tile_id: tileId,
+      sender_pane_id: senderPaneId ?? null,
+      sender_agent_id: senderAgentId ?? null,
+    });
+  }
+
+  async tileMove(
+    tileId: string,
+    x: number,
+    y: number,
+    senderPaneId?: string | null,
+    senderAgentId?: string | null,
+  ): Promise<SessionTileInfo> {
+    return this.sendCommand({
+      command: 'tile_move',
+      tile_id: tileId,
+      x,
+      y,
+      sender_pane_id: senderPaneId ?? null,
+      sender_agent_id: senderAgentId ?? null,
+    });
+  }
+
+  async tileResize(
+    tileId: string,
+    width: number,
+    height: number,
+    senderPaneId?: string | null,
+    senderAgentId?: string | null,
+  ): Promise<SessionTileInfo> {
+    return this.sendCommand({
+      command: 'tile_resize',
+      tile_id: tileId,
+      width,
+      height,
+      sender_pane_id: senderPaneId ?? null,
+      sender_agent_id: senderAgentId ?? null,
+    });
+  }
+
+  async workList(senderPaneId?: string | null): Promise<WorkItem[]> {
+    return this.sendCommand({
+      command: 'work_list',
+      scope: 'current_session',
+      sender_pane_id: senderPaneId ?? null,
+    });
+  }
+
+  async workGet(workId: string, senderPaneId?: string | null): Promise<WorkItem> {
+    return this.sendCommand({
+      command: 'work_get',
+      work_id: workId,
+      sender_pane_id: senderPaneId ?? null,
+    });
+  }
+
+  async networkConnect(
+    fromTileId: string,
+    fromPort: string,
+    toTileId: string,
+    toPort: string,
+    senderPaneId?: string | null,
+    senderAgentId?: string | null,
+  ): Promise<NetworkConnection> {
+    return this.sendCommand({
+      command: 'network_connect',
+      from_tile_id: fromTileId,
+      from_port: fromPort,
+      to_tile_id: toTileId,
+      to_port: toPort,
+      sender_pane_id: senderPaneId ?? null,
+      sender_agent_id: senderAgentId ?? null,
+    });
+  }
+
+  async networkDisconnect(
+    tileId: string,
+    port: string,
+    senderPaneId?: string | null,
+    senderAgentId?: string | null,
+  ): Promise<NetworkConnection | null> {
+    return this.sendCommand({
+      command: 'network_disconnect',
+      tile_id: tileId,
+      port,
+      sender_pane_id: senderPaneId ?? null,
+      sender_agent_id: senderAgentId ?? null,
+    });
+  }
+
+  async workCreate(title: string, senderPaneId?: string | null, sessionId?: string | null): Promise<WorkItem> {
+    return this.sendCommand({
+      command: 'work_create',
+      title,
+      sender_pane_id: senderPaneId ?? null,
+      session_id: sessionId ?? null,
+    });
+  }
+
+  async workStageStart(workId: string, agentId: string): Promise<WorkItem> {
+    return this.sendCommand({
+      command: 'work_stage_start',
+      work_id: workId,
+      agent_id: agentId,
+    });
+  }
+
+  async workStageComplete(workId: string, agentId: string): Promise<WorkItem> {
+    return this.sendCommand({
+      command: 'work_stage_complete',
+      work_id: workId,
+      agent_id: agentId,
+    });
+  }
+
+  async workReviewApprove(workId: string): Promise<WorkItem> {
+    return this.sendCommand({
+      command: 'work_review_approve',
+      work_id: workId,
+    });
+  }
+
+  async workReviewImprove(workId: string, comment: string): Promise<WorkItem> {
+    return this.sendCommand({
+      command: 'work_review_improve',
+      work_id: workId,
+      comment,
+    });
   }
 
   async testDomQuery<T = unknown>(js: string): Promise<T> {

@@ -1,23 +1,37 @@
 import { get } from 'svelte/store';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AppStateTree, TmuxSnapshot } from '../types';
+import type { AppStateTree, TmuxSnapshot, WorkItem } from '../types';
 
 const tauriMocks = vi.hoisted(() => ({
+  approveWorkItem: vi.fn(),
+  connectNetworkTiles: vi.fn(),
+  createWorkItem: vi.fn(),
+  deleteWorkItem: vi.fn(),
+  disconnectNetworkPort: vi.fn(),
+  sendDirectMessageCommand: vi.fn(),
+  sendPublicMessageCommand: vi.fn(),
+  getAgentDebugState: vi.fn(),
   getClaudeMenuDataForPane: vi.fn(),
   getLayoutState: vi.fn(),
   getTmuxState: vi.fn(),
+  getWorkItems: vi.fn(),
+  improveWorkItem: vi.fn(),
   killPane: vi.fn(),
   killSession: vi.fn(),
   killWindow: vi.fn(),
   newSession: vi.fn(),
   newWindow: vi.fn(),
+  readWorkStagePreview: vi.fn(),
   renameSession: vi.fn(),
   renameWindow: vi.fn(),
   resizeWindow: vi.fn(),
   saveLayoutState: vi.fn(),
+  sendRootMessageCommand: vi.fn(),
   selectSession: vi.fn(),
   selectWindow: vi.fn(),
   setPaneTitle: vi.fn(),
+  spawnBrowserWindow: vi.fn(),
+  spawnAgentWindow: vi.fn(),
   writePane: vi.fn(),
 }));
 
@@ -25,26 +39,43 @@ vi.mock('../tauri', () => tauriMocks);
 
 import {
   __resetWindowResizeTrackingForTest,
+  agentInfos,
   applyPaneReadOnlyToState,
   applyPaneRoleToState,
+  applyAgentDebugStateToState,
   applyTmuxSnapshot,
   applyTmuxSnapshotToState,
   appState,
+  activeNetworkDrag,
+  appendChatterEntryToState,
+  applyWorkItemsToState,
   autoArrange,
+  beginNetworkPortDrag,
   beginSidebarRename,
+  bootstrapAppState,
+  buildCanvasWorkCards,
   buildContextMenuItems,
   buildCanvasConnections,
+  buildAgentActivityEntries,
+  clientDeltaToWorldDelta,
+  buildRenderedNetworkConnections,
   buildSidebarItems,
   buildSidebarRenameCommand,
   calculateWindowSizeRequest,
+  completeNetworkPortDrag,
   dismissContextMenuInState,
   initialAppState,
+  networkReleaseAnimation,
   openCanvasContextMenuInState,
   openPaneContextMenuInState,
   parseCommandBarCommand,
   reduceContextMenuSelection,
   reportPaneViewport,
   reduceIntent,
+  executeCommandBarCommand,
+  activeSessionWorkItems,
+  topicInfos,
+  updateNetworkPortDrag,
 } from './appState';
 
 function freshState(): AppStateTree {
@@ -59,8 +90,8 @@ function baseSnapshot(): TmuxSnapshot {
     active_window_id: '@1',
     active_pane_id: '%1',
     sessions: [
-      { id: '$1', name: 'Main', active: true, window_ids: ['@1', '@2'], active_window_id: '@1' },
-      { id: '$2', name: 'Build', active: false, window_ids: ['@3'], active_window_id: '@3' },
+      { id: '$1', name: 'Main', active: true, window_ids: ['@1', '@2'], active_window_id: '@1', root_cwd: '/Users/skryl/Dev/herd' },
+      { id: '$2', name: 'Build', active: false, window_ids: ['@3'], active_window_id: '@3', root_cwd: '/Users/skryl/Dev/herd/src-tauri' },
     ],
     windows: [
       { id: '@1', session_id: '$1', session_name: 'Main', index: 0, name: 'shell', active: true, cols: 80, rows: 24, pane_ids: ['%1'] },
@@ -143,11 +174,38 @@ function entriesOverlap(
 
 beforeEach(() => {
   appState.set(freshState());
+  activeNetworkDrag.set(null);
+  networkReleaseAnimation.set(null);
   __resetWindowResizeTrackingForTest();
   Object.values(tauriMocks).forEach((mockFn) => mockFn.mockReset());
   tauriMocks.getClaudeMenuDataForPane.mockResolvedValue({ commands: [], skills: [] });
+  tauriMocks.getAgentDebugState.mockResolvedValue({ agents: [], topics: [], chatter: [], agent_logs: [], connections: [] });
+  tauriMocks.getWorkItems.mockResolvedValue([]);
   tauriMocks.resizeWindow.mockResolvedValue(undefined);
+  tauriMocks.spawnAgentWindow.mockResolvedValue(undefined);
+  tauriMocks.connectNetworkTiles.mockResolvedValue(undefined);
+  tauriMocks.disconnectNetworkPort.mockResolvedValue(null);
 });
+
+function sampleWorkItem(overrides: Partial<WorkItem> = {}): WorkItem {
+  return {
+    work_id: 'work-s1-001',
+    session_id: '$1',
+    title: 'Socket refactor',
+    topic: '#work-s1-001',
+    owner_agent_id: null,
+    current_stage: 'plan',
+    stages: [
+      { stage: 'plan', status: 'ready', file_path: '/tmp/plan.md' },
+      { stage: 'prd', status: 'ready', file_path: '/tmp/prd.md' },
+      { stage: 'artifact', status: 'ready', file_path: '/tmp/artifact.md' },
+    ],
+    reviews: [],
+    created_at: 1,
+    updated_at: 1,
+    ...overrides,
+  };
+}
 
 describe('applyTmuxSnapshotToState', () => {
   it('hydrates tmux sessions, windows, and tile layout from the snapshot', () => {
@@ -159,6 +217,7 @@ describe('applyTmuxSnapshotToState', () => {
     expect(next.tmux.activePaneId).toBe('%1');
     expect(next.tmux.sessionOrder).toEqual(['$1', '$2']);
     expect(next.tmux.windowOrder).toEqual(['@1', '@2', '@3']);
+    expect(next.tmux.sessions['$1'].root_cwd).toBe('/Users/skryl/Dev/herd');
     expect(next.ui.selectedPaneId).toBe('%1');
     expect(Object.keys(next.layout.entries)).toEqual(['@1', '@2', '@3']);
   });
@@ -167,6 +226,7 @@ describe('applyTmuxSnapshotToState', () => {
     const withSnapshot = applyTmuxSnapshotToState(freshState(), baseSnapshot());
     withSnapshot.layout.entries['@1'] = { x: 10, y: 20, width: 500, height: 300 };
     withSnapshot.layout.entries['@9'] = { x: 1, y: 1, width: 1, height: 1 };
+    withSnapshot.layout.entries['work:work-s1-001'] = { x: 1400, y: 120, width: 360, height: 320 };
     const readOnlyState = applyPaneReadOnlyToState(withSnapshot, '%2', true);
 
     const next = applyTmuxSnapshotToState(readOnlyState, {
@@ -186,6 +246,7 @@ describe('applyTmuxSnapshotToState', () => {
 
     expect(next.layout.entries['@1']).toEqual({ x: 10, y: 20, width: 500, height: 300 });
     expect(next.layout.entries['@9']).toBeUndefined();
+    expect(next.layout.entries['work:work-s1-001']).toEqual({ x: 1400, y: 120, width: 360, height: 320 });
     expect(next.tmux.panes['%2']).toBeUndefined();
   });
 
@@ -270,6 +331,440 @@ describe('applyTmuxSnapshotToState', () => {
   });
 });
 
+describe('network connectors', () => {
+  it('builds curved network connector control points', () => {
+    const state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
+    state.layout.entries['@1'] = { x: 0, y: 0, width: 240, height: 160 };
+    state.layout.entries['@2'] = { x: 420, y: 40, width: 260, height: 180 };
+    state.network.connections = [{
+      session_id: '$1',
+      from_tile_id: '%1',
+      from_port: 'right',
+      to_tile_id: '%2',
+      to_port: 'left',
+    }];
+
+    const [connection] = buildRenderedNetworkConnections(state);
+    expect(connection).toMatchObject({
+      fromTileId: '%1',
+      fromPort: 'right',
+      toTileId: '%2',
+      toPort: 'left',
+      x1: 240,
+      y1: 80,
+      x2: 420,
+      y2: 130,
+    });
+    expect(connection.cx1).toBeGreaterThan(connection.x1);
+    expect(connection.cx2).toBeLessThan(connection.x2);
+  });
+
+  it('snaps network drags to the nearest valid target port and completes on mouseup', async () => {
+    const state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
+    state.layout.entries['@1'] = { x: 0, y: 0, width: 240, height: 160 };
+    state.layout.entries['@2'] = { x: 420, y: 40, width: 260, height: 180 };
+    appState.set(state);
+
+    beginNetworkPortDrag('%1', 'right', 240, 80);
+    updateNetworkPortDrag(405, 136);
+
+    expect(get(activeNetworkDrag)).toMatchObject({
+      snappedTileId: '%2',
+      snappedPort: 'left',
+      snappedX: 420,
+      snappedY: 130,
+    });
+
+    await completeNetworkPortDrag();
+
+    expect(tauriMocks.connectNetworkTiles).toHaveBeenCalledWith('%1', 'right', '%2', 'left');
+  });
+
+  it('detaches occupied drags from the opposite endpoint', () => {
+    const state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
+    state.layout.entries['@1'] = { x: 0, y: 0, width: 240, height: 160 };
+    state.layout.entries['@2'] = { x: 420, y: 40, width: 260, height: 180 };
+    state.network.connections = [{
+      session_id: '$1',
+      from_tile_id: '%1',
+      from_port: 'right',
+      to_tile_id: '%2',
+      to_port: 'left',
+    }];
+    appState.set(state);
+
+    beginNetworkPortDrag('%1', 'right', 240, 80);
+
+    expect(get(activeNetworkDrag)).toMatchObject({
+      tileId: '%2',
+      port: 'left',
+      grabbedTileId: '%1',
+      grabbedPort: 'right',
+      startX: 420,
+      startY: 130,
+      currentX: 240,
+      currentY: 80,
+      startedOccupied: true,
+    });
+  });
+
+  it('reconnects occupied drags from the anchored endpoint', async () => {
+    const snapshot = baseSnapshot();
+    snapshot.sessions[0].window_ids.push('@4');
+    snapshot.windows.push({
+      id: '@4',
+      session_id: '$1',
+      session_name: 'Main',
+      index: 2,
+      name: 'worker',
+      active: false,
+      cols: 80,
+      rows: 24,
+      pane_ids: ['%4'],
+    });
+    snapshot.panes.push({
+      id: '%4',
+      session_id: '$1',
+      window_id: '@4',
+      window_index: 2,
+      pane_index: 0,
+      cols: 80,
+      rows: 24,
+      title: 'worker',
+      command: 'zsh',
+      active: false,
+      dead: false,
+    });
+
+    const state = applyTmuxSnapshotToState(freshState(), snapshot);
+    state.layout.entries['@1'] = { x: 0, y: 0, width: 240, height: 160 };
+    state.layout.entries['@2'] = { x: 420, y: 40, width: 260, height: 180 };
+    state.layout.entries['@4'] = { x: 780, y: 40, width: 260, height: 180 };
+    state.network.connections = [{
+      session_id: '$1',
+      from_tile_id: '%1',
+      from_port: 'right',
+      to_tile_id: '%2',
+      to_port: 'left',
+    }];
+    appState.set(state);
+
+    beginNetworkPortDrag('%1', 'right', 240, 80);
+    await completeNetworkPortDrag('%4', 'left');
+
+    expect(tauriMocks.connectNetworkTiles).toHaveBeenCalledWith('%2', 'left', '%4', 'left');
+  });
+
+  it('starts a retract animation when an occupied drag is released without reconnecting', async () => {
+    const state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
+    state.layout.entries['@1'] = { x: 0, y: 0, width: 240, height: 160 };
+    state.layout.entries['@2'] = { x: 420, y: 40, width: 260, height: 180 };
+    state.network.connections = [{
+      session_id: '$1',
+      from_tile_id: '%1',
+      from_port: 'right',
+      to_tile_id: '%2',
+      to_port: 'left',
+    }];
+    appState.set(state);
+
+    beginNetworkPortDrag('%1', 'right', 240, 80);
+    updateNetworkPortDrag(332, 108);
+    await completeNetworkPortDrag();
+
+    expect(tauriMocks.disconnectNetworkPort).toHaveBeenCalledWith('%2', 'left');
+    expect(get(networkReleaseAnimation)).toMatchObject({
+      anchorTileId: '%2',
+      anchorPort: 'left',
+      anchorX: 420,
+      anchorY: 130,
+    });
+  });
+});
+
+describe('work state', () => {
+  it('bootstraps current-session work items from tauri', async () => {
+    tauriMocks.getLayoutState.mockResolvedValue({});
+    tauriMocks.getTmuxState.mockResolvedValue(baseSnapshot());
+    tauriMocks.getAgentDebugState.mockResolvedValue({ agents: [], topics: [], chatter: [], agent_logs: [], connections: [] });
+    tauriMocks.getWorkItems.mockResolvedValue([
+      sampleWorkItem(),
+      sampleWorkItem({
+        work_id: 'work-s1-002',
+        title: 'PRD review',
+        current_stage: 'prd',
+        stages: [
+          { stage: 'plan', status: 'approved', file_path: '/tmp/plan-2.md' },
+          { stage: 'prd', status: 'completed', file_path: '/tmp/prd-2.md' },
+          { stage: 'artifact', status: 'ready', file_path: '/tmp/artifact-2.md' },
+        ],
+        updated_at: 20,
+      }),
+    ]);
+
+    await bootstrapAppState();
+
+    const state = get(appState);
+    expect(state.work.order).toEqual(['work-s1-001', 'work-s1-002']);
+    expect(state.work.items['work-s1-002'].title).toBe('PRD review');
+  });
+
+  it('keeps work state on tmux snapshot updates and exposes current-session items', () => {
+    const seeded = applyWorkItemsToState(
+      applyTmuxSnapshotToState(freshState(), baseSnapshot()),
+      [
+        sampleWorkItem(),
+        sampleWorkItem({
+          work_id: 'work-s2-001',
+          session_id: '$2',
+          title: 'Artifact polish',
+          topic: '#work-s2-001',
+        }),
+      ],
+    );
+    appState.set(seeded);
+
+    const switched = applyTmuxSnapshotToState(seeded, {
+      ...baseSnapshot(),
+      version: 2,
+      active_session_id: '$2',
+      active_window_id: '@3',
+      active_pane_id: '%3',
+      sessions: [
+        { id: '$1', name: 'Main', active: false, window_ids: ['@1', '@2'], active_window_id: '@1', root_cwd: '/Users/skryl/Dev/herd' },
+        { id: '$2', name: 'Build', active: true, window_ids: ['@3'], active_window_id: '@3', root_cwd: '/Users/skryl/Dev/herd/src-tauri' },
+      ],
+    });
+    appState.set(switched);
+
+    expect(switched.work.order).toEqual(['work-s1-001', 'work-s2-001']);
+    expect(get(activeSessionWorkItems).map((item) => item.work_id)).toEqual(['work-s2-001']);
+  });
+});
+
+describe('session-scoped agent debug state', () => {
+  it('normalizes pointer movement by the current canvas zoom', () => {
+    expect(clientDeltaToWorldDelta(40, 20, 2)).toEqual({ dx: 20, dy: 10 });
+    expect(clientDeltaToWorldDelta(40, 20, 0.5)).toEqual({ dx: 80, dy: 40 });
+  });
+
+  it('keeps only active-session agents, topics, and chatter from debug snapshots', () => {
+    const state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
+    const next = applyAgentDebugStateToState(state, {
+      agents: [
+        {
+          agent_id: 'agent-1',
+          agent_type: 'claude',
+          agent_role: 'worker',
+          tile_id: '%1',
+          window_id: '@1',
+          session_id: '$1',
+          title: 'Agent',
+          display_name: 'Agent 1',
+          alive: true,
+          chatter_subscribed: true,
+          topics: ['#work-s1-001'],
+        },
+        {
+          agent_id: 'agent-2',
+          agent_type: 'claude',
+          agent_role: 'worker',
+          tile_id: '%3',
+          window_id: '@3',
+          session_id: '$2',
+          title: 'Agent',
+          display_name: 'Agent 2',
+          alive: true,
+          chatter_subscribed: true,
+          topics: ['#work-s2-001'],
+        },
+      ],
+      agent_logs: [],
+      connections: [],
+      topics: [
+        { session_id: '$1', name: '#work-s1-001', subscriber_count: 1, last_activity_at: 10 },
+        { session_id: '$2', name: '#work-s2-001', subscriber_count: 1, last_activity_at: 20 },
+      ],
+      chatter: [
+        {
+          session_id: '$1',
+          kind: 'public',
+          from_agent_id: 'agent-1',
+          from_display_name: 'Agent 1',
+          message: 'hello from main',
+          to_agent_id: null,
+          to_display_name: null,
+          topics: ['#work-s1-001'],
+          mentions: [],
+          timestamp_ms: 1,
+          public: true,
+          display_text: 'Agent 1 -> Chatter: hello from main',
+        },
+        {
+          session_id: '$2',
+          kind: 'public',
+          from_agent_id: 'agent-2',
+          from_display_name: 'Agent 2',
+          message: 'hello from build',
+          to_agent_id: null,
+          to_display_name: null,
+          topics: ['#work-s2-001'],
+          mentions: [],
+          timestamp_ms: 2,
+          public: true,
+          display_text: 'Agent 2 -> Chatter: hello from build',
+        },
+      ],
+    });
+
+    expect(Object.keys(next.agents)).toEqual(['agent-1']);
+    expect(Object.keys(next.topics)).toEqual(['#work-s1-001']);
+    expect(next.chatter.map((entry) => entry.session_id)).toEqual(['$1']);
+  });
+
+  it('ignores chatter append events from other sessions and derives active-session registry views', () => {
+    const seeded = applyAgentDebugStateToState(
+      applyTmuxSnapshotToState(freshState(), baseSnapshot()),
+      {
+        agents: [
+          {
+            agent_id: 'agent-1',
+            agent_type: 'claude',
+            agent_role: 'worker',
+            tile_id: '%1',
+            window_id: '@1',
+            session_id: '$1',
+            title: 'Agent',
+            display_name: 'Agent 1',
+            alive: true,
+            chatter_subscribed: true,
+            topics: ['#work-s1-001'],
+          },
+          {
+            agent_id: 'agent-2',
+            agent_type: 'claude',
+            agent_role: 'worker',
+            tile_id: '%3',
+            window_id: '@3',
+            session_id: '$2',
+            title: 'Agent',
+            display_name: 'Agent 2',
+            alive: true,
+            chatter_subscribed: true,
+            topics: ['#work-s2-001'],
+          },
+        ],
+        agent_logs: [],
+        connections: [],
+        topics: [
+          { session_id: '$1', name: '#work-s1-001', subscriber_count: 1, last_activity_at: 10 },
+          { session_id: '$2', name: '#work-s2-001', subscriber_count: 1, last_activity_at: 20 },
+        ],
+        chatter: [],
+      },
+    );
+    appState.set(seeded);
+
+    appState.update((state) =>
+      appendChatterEntryToState(state, {
+        session_id: '$2',
+        kind: 'public',
+        from_agent_id: 'agent-2',
+        from_display_name: 'Agent 2',
+        message: 'foreign',
+        to_agent_id: null,
+        to_display_name: null,
+        topics: ['#work-s2-001'],
+        mentions: [],
+        timestamp_ms: 99,
+        public: true,
+        display_text: 'Agent 2 -> Chatter: foreign',
+      }),
+    );
+
+    expect(get(agentInfos).map((agent) => agent.agent_id)).toEqual(['agent-1']);
+    expect(get(topicInfos).map((topic) => topic.name)).toEqual(['#work-s1-001']);
+    expect(get(appState).chatter).toEqual([]);
+  });
+
+  it('merges persisted agent logs into agent activity entries in timestamp order', () => {
+    const state = applyAgentDebugStateToState(
+      applyTmuxSnapshotToState(freshState(), baseSnapshot()),
+      {
+        agents: [
+          {
+            agent_id: 'agent-1',
+            agent_type: 'claude',
+            agent_role: 'worker',
+            tile_id: '%1',
+            window_id: '@1',
+            session_id: '$1',
+            title: 'Agent',
+            display_name: 'Agent 1',
+            alive: true,
+            chatter_subscribed: true,
+            topics: [],
+          },
+        ],
+        topics: [],
+        chatter: [
+          {
+            session_id: '$1',
+            kind: 'direct',
+            from_agent_id: 'agent-2',
+            from_display_name: 'Agent 2',
+            to_agent_id: 'agent-1',
+            to_display_name: 'Agent 1',
+            message: 'hello',
+            topics: [],
+            mentions: [],
+            timestamp_ms: 20,
+            public: false,
+            display_text: 'Agent 2 -> Agent 1: hello',
+          },
+        ],
+        agent_logs: [
+          {
+            session_id: '$1',
+            agent_id: 'agent-1',
+            tile_id: '%1',
+            kind: 'incoming_hook',
+            text: 'MCP hook [system] Port connected: %1:left <-> work:work-s1-001:left',
+            timestamp_ms: 10,
+          },
+          {
+            session_id: '$1',
+            agent_id: 'agent-1',
+            tile_id: '%1',
+            kind: 'outgoing_call',
+            text: 'MCP call message_direct {"to_agent_id":"agent-2","message":"hello"}',
+            timestamp_ms: 30,
+          },
+        ],
+        connections: [],
+      },
+    );
+
+    expect(buildAgentActivityEntries(state, '%1')).toEqual([
+      {
+        kind: 'incoming_hook',
+        text: 'MCP hook [system] Port connected: %1:left <-> work:work-s1-001:left',
+        timestamp_ms: 10,
+      },
+      {
+        kind: 'incoming_dm',
+        text: 'Agent 2 -> Agent 1: hello',
+        timestamp_ms: 20,
+      },
+      {
+        kind: 'outgoing_call',
+        text: 'MCP call message_direct {"to_agent_id":"agent-2","message":"hello"}',
+        timestamp_ms: 30,
+      },
+    ]);
+  });
+});
+
 describe('reduceIntent', () => {
   it('maps new shell controls to tmux window creation in the active session', () => {
     const state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
@@ -288,6 +783,36 @@ describe('reduceIntent', () => {
     expect(reduceIntent(state, { type: 'close-selected-pane' }).effects).toEqual([
       { type: 'kill-window', windowId: '@1' },
     ]);
+  });
+
+  it('opens a confirmation dialog before closing a root agent pane', () => {
+    const seeded = applyPaneRoleToState(
+      applyTmuxSnapshotToState(freshState(), baseSnapshot()),
+      '%1',
+      'root_agent',
+    );
+
+    const result = reduceIntent(seeded, { type: 'close-selected-pane' });
+    expect(result.effects).toEqual([]);
+    expect(result.state.ui.closePaneConfirmation).toEqual({
+      paneId: '%1',
+      title: 'CLOSE ROOT AGENT',
+      message: 'Close this Root agent? Herd will restart it automatically.',
+      confirmLabel: 'Close Root Agent',
+    });
+  });
+
+  it('confirms a root agent close by killing its window', () => {
+    const seeded = applyPaneRoleToState(
+      applyTmuxSnapshotToState(freshState(), baseSnapshot()),
+      '%1',
+      'root_agent',
+    );
+    const withDialog = reduceIntent(seeded, { type: 'close-selected-pane' }).state;
+
+    const result = reduceIntent(withDialog, { type: 'confirm-close-pane' });
+    expect(result.effects).toEqual([{ type: 'kill-window', windowId: '@1' }]);
+    expect(result.state.ui.closePaneConfirmation).toBeNull();
   });
 
   it('requests confirmation before closing the last window because it would kill the session', () => {
@@ -471,26 +996,85 @@ describe('reduceIntent', () => {
     ]);
   });
 
-  it('switches tabs and focuses the tile when tree navigation lands on another pane', () => {
+  it('keeps the tmux tree local to the active tab and focuses panes without switching tabs', () => {
     const state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
-    const paneIndex = buildSidebarItems(state).findIndex((item) => item.paneId === '%3');
+    const sidebarItems = buildSidebarItems(state);
+    expect(sidebarItems.every((item) => item.sessionId === '$1')).toBe(true);
+
+    const paneIndex = sidebarItems.findIndex((item) => item.paneId === '%2');
     const result = reduceIntent(state, { type: 'set-sidebar-selection', index: paneIndex });
 
     expect(result.state.ui.sidebarSelectedIdx).toBe(paneIndex);
-    expect(result.state.ui.selectedPaneId).toBe('%3');
-    expect(result.effects).toEqual([
-      { type: 'select-session', sessionId: '$2' },
-      { type: 'select-window', windowId: '@3' },
-    ]);
+    expect(result.state.ui.selectedPaneId).toBe('%2');
+    expect(result.effects).toEqual([{ type: 'select-window', windowId: '@2' }]);
   });
 
-  it('switches tabs when tree navigation lands on another session', () => {
-    const state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
-    const sessionIndex = buildSidebarItems(state).findIndex((item) => item.type === 'session' && item.sessionId === '$2');
-    const result = reduceIntent(state, { type: 'set-sidebar-selection', index: sessionIndex });
+  it('moves focus between sidebar sections and uses section-local j/k navigation', () => {
+    let state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
+    state = applyWorkItemsToState(state, [
+      sampleWorkItem(),
+      sampleWorkItem({
+        work_id: 'work-s1-002',
+        title: 'Artifact polish',
+        topic: '#work-s1-002',
+      }),
+    ]);
+    state = applyAgentDebugStateToState(state, {
+      agents: [
+        {
+          agent_id: 'agent-1',
+          agent_type: 'claude',
+          agent_role: 'worker',
+          tile_id: '%2',
+          window_id: '@2',
+          session_id: '$1',
+          title: 'Agent',
+          display_name: 'Agent 1',
+          alive: true,
+          chatter_subscribed: true,
+          topics: ['#work-s1-002'],
+        },
+      ],
+      agent_logs: [],
+      connections: [],
+      topics: [],
+      chatter: [],
+    });
 
-    expect(result.state.ui.selectedPaneId).toBe('%3');
-    expect(result.effects).toEqual([{ type: 'select-session', sessionId: '$2' }]);
+    state = reduceIntent(state, { type: 'move-sidebar-section', delta: -1 }).state;
+    expect(state.ui.sidebarSection).toBe('agents');
+    expect(state.ui.selectedPaneId).toBe('%2');
+
+    state = reduceIntent(state, { type: 'move-sidebar-section', delta: -1 }).state;
+    expect(state.ui.sidebarSection).toBe('work');
+    expect(state.ui.selectedWorkId).toBe('work-s1-001');
+
+    state = reduceIntent(state, { type: 'move-sidebar-selection', delta: 1 }).state;
+    expect(state.ui.selectedWorkId).toBe('work-s1-002');
+
+    state = reduceIntent(state, { type: 'move-sidebar-section', delta: -1 }).state;
+    expect(state.ui.sidebarSection).toBe('settings');
+
+    state = reduceIntent(state, { type: 'move-sidebar-section', delta: 1 }).state;
+    expect(state.ui.sidebarSection).toBe('work');
+    expect(state.ui.selectedWorkId).toBe('work-s1-002');
+  });
+
+  it('shows a root-specific close label in the pane context menu', () => {
+    const seeded = openPaneContextMenuInState(
+      applyPaneRoleToState(
+        applyTmuxSnapshotToState(freshState(), baseSnapshot()),
+        '%1',
+        'root_agent',
+      ),
+      '%1',
+      420,
+      240,
+    );
+
+    expect(buildContextMenuItems(seeded)).toEqual([
+      { id: 'close-shell', label: 'Close Root Agent', kind: 'action', disabled: false },
+    ]);
   });
 });
 
@@ -500,7 +1084,7 @@ describe('buildCanvasConnections', () => {
       ...baseSnapshot(),
       windows: [
         { ...baseSnapshot().windows[0] },
-        { ...baseSnapshot().windows[1], parent_window_id: '@1' },
+        { ...baseSnapshot().windows[1], parent_window_id: '@1', parent_window_source: 'hook' },
         { ...baseSnapshot().windows[2] },
       ],
     });
@@ -509,6 +1093,95 @@ describe('buildCanvasConnections', () => {
     expect(connections).toHaveLength(1);
     expect(connections[0].parentWindowId).toBe('@1');
     expect(connections[0].childWindowId).toBe('@2');
+  });
+
+  it('does not draw manual parent-child lineage lines', () => {
+    const state = applyTmuxSnapshotToState(freshState(), {
+      ...baseSnapshot(),
+      windows: [
+        { ...baseSnapshot().windows[0] },
+        { ...baseSnapshot().windows[1], parent_window_id: '@1', parent_window_source: 'manual' },
+        { ...baseSnapshot().windows[2] },
+      ],
+    });
+
+    expect(buildCanvasConnections(state)).toHaveLength(0);
+  });
+});
+
+describe('buildCanvasWorkCards', () => {
+  it('does not auto-select work just because the active tab has work items', () => {
+    const state = applyWorkItemsToState(
+      applyTmuxSnapshotToState(freshState(), baseSnapshot()),
+      [sampleWorkItem()],
+    );
+
+    expect(state.ui.selectedWorkId).toBeNull();
+    expect(state.ui.sidebarSection).toBe('tmux');
+  });
+
+  it('builds one work card per active-session item and places them to the right of terminal tiles', () => {
+    const state = applyWorkItemsToState(
+      applyTmuxSnapshotToState(freshState(), baseSnapshot()),
+      [
+        sampleWorkItem(),
+        sampleWorkItem({
+          work_id: 'work-s1-002',
+          title: 'Artifact polish',
+          topic: '#work-s1-002',
+        }),
+        sampleWorkItem({
+          work_id: 'work-s2-001',
+          session_id: '$2',
+          title: 'Build PRD',
+          topic: '#work-s2-001',
+        }),
+      ],
+    );
+
+    state.layout.entries['@1'] = { x: 100, y: 80, width: 640, height: 400 };
+    state.layout.entries['@2'] = { x: 860, y: 120, width: 640, height: 400 };
+    state.layout.entries['@3'] = { x: 40, y: 60, width: 640, height: 400 };
+
+    const cards = buildCanvasWorkCards(state);
+
+    expect(cards).toHaveLength(2);
+    expect(cards.map((card) => card.workId)).toEqual(['work-s1-001', 'work-s1-002']);
+    expect(cards[0].x).toBeGreaterThan(1500);
+    expect(cards[0].y).toBe(80);
+    expect(cards[1].y).toBeGreaterThan(cards[0].y + cards[0].height);
+  });
+
+  it('creates a persisted layout entry for new work items and uses that layout on the canvas', () => {
+    const state = applyWorkItemsToState(
+      applyTmuxSnapshotToState(freshState(), baseSnapshot()),
+      [sampleWorkItem()],
+    );
+
+    expect(state.layout.entries['work:work-s1-001']).toEqual({
+      x: expect.any(Number),
+      y: expect.any(Number),
+      width: 360,
+      height: 320,
+    });
+
+    state.layout.entries['work:work-s1-001'] = {
+      x: 2220,
+      y: 420,
+      width: 480,
+      height: 360,
+    };
+
+    const cards = buildCanvasWorkCards(state);
+    expect(cards).toEqual([
+      {
+        workId: 'work-s1-001',
+        x: 2220,
+        y: 420,
+        width: 480,
+        height: 360,
+      },
+    ]);
   });
 });
 
@@ -553,6 +1226,13 @@ describe('context menu state', () => {
     state.ui.canvas = { panX: 100, panY: 50, zoom: 2 };
     state = openCanvasContextMenuInState(state, 320, 250);
 
+    expect(buildContextMenuItems(state).map((item) => item.id)).toEqual([
+      'new-shell',
+      'new-agent',
+      'new-browser',
+      'new-work',
+    ]);
+
     const selected = reduceContextMenuSelection(state, 'new-shell');
     expect(selected.effects).toEqual([{ type: 'new-window', sessionId: '$1' }]);
     expect(selected.state.ui.contextMenu).toBeNull();
@@ -561,6 +1241,27 @@ describe('context menu state', () => {
       worldX: 110,
       worldY: 100,
     });
+  });
+
+  it('maps canvas Agent, Browser, and Work selections to their matching actions', () => {
+    let state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
+    state.ui.canvas = { panX: 100, panY: 50, zoom: 2 };
+    state = openCanvasContextMenuInState(state, 320, 250);
+
+    expect(reduceContextMenuSelection(state, 'new-agent').effects).toEqual([
+      { type: 'new-agent-window', sessionId: '$1' },
+    ]);
+
+    expect(reduceContextMenuSelection(state, 'new-browser').effects).toEqual([
+      { type: 'new-browser-window', sessionId: '$1' },
+    ]);
+
+    expect(reduceContextMenuSelection(state, 'new-work').effects).toEqual([
+      {
+        type: 'open-work-dialog',
+        placement: { sessionId: '$1', worldX: 110, worldY: 100 },
+      },
+    ]);
   });
 
   it('applies the pending click placement to the next created window instead of default layout', () => {
@@ -726,6 +1427,50 @@ describe('parseCommandBarCommand', () => {
       intent: { type: 'rename-active-tab', name: 'Ops' },
     });
   });
+
+  it('maps sudo command bar verbs', () => {
+    expect(parseCommandBarCommand('sudo please inspect local work')).toEqual({
+      type: 'sudo',
+      message: 'please inspect local work',
+    });
+    expect(parseCommandBarCommand('sudo')).toEqual({ type: 'none' });
+  });
+
+  it('maps dm and cm command bar verbs', () => {
+    expect(parseCommandBarCommand('dm 10 hi there')).toEqual({
+      type: 'dm',
+      target: '10',
+      message: 'hi there',
+    });
+    expect(parseCommandBarCommand('cm hey all!')).toEqual({
+      type: 'cm',
+      message: 'hey all!',
+    });
+    expect(parseCommandBarCommand('dm')).toEqual({ type: 'none' });
+    expect(parseCommandBarCommand('dm 10')).toEqual({ type: 'none' });
+    expect(parseCommandBarCommand('cm')).toEqual({ type: 'none' });
+  });
+});
+
+describe('executeCommandBarCommand', () => {
+  it('routes sudo through the root message invoke', async () => {
+    tauriMocks.sendRootMessageCommand.mockResolvedValue(undefined);
+
+    await executeCommandBarCommand('sudo please inspect local work');
+
+    expect(tauriMocks.sendRootMessageCommand).toHaveBeenCalledWith('please inspect local work');
+  });
+
+  it('routes dm and cm through the user message invokes', async () => {
+    tauriMocks.sendDirectMessageCommand.mockResolvedValue(undefined);
+    tauriMocks.sendPublicMessageCommand.mockResolvedValue(undefined);
+
+    await executeCommandBarCommand('dm 10 hi there');
+    await executeCommandBarCommand('cm hey all!');
+
+    expect(tauriMocks.sendDirectMessageCommand).toHaveBeenCalledWith('10', 'hi there');
+    expect(tauriMocks.sendPublicMessageCommand).toHaveBeenCalledWith('hey all!');
+  });
 });
 
 describe('autoArrange', () => {
@@ -857,10 +1602,10 @@ describe('autoArrange', () => {
 describe('sidebar rename helpers', () => {
   it('builds a session rename command from the selected tree item', () => {
     const state = applyTmuxSnapshotToState(freshState(), baseSnapshot());
-    const sessionIndex = buildSidebarItems(state).findIndex((item) => item.type === 'session' && item.sessionId === '$2');
+    const sessionIndex = buildSidebarItems(state).findIndex((item) => item.type === 'session' && item.sessionId === '$1');
     state.ui.sidebarSelectedIdx = sessionIndex;
 
-    expect(buildSidebarRenameCommand(state)).toBe('tr Build');
+    expect(buildSidebarRenameCommand(state)).toBe('tr Main');
   });
 
   it('builds a window rename command from the selected tree item', () => {
