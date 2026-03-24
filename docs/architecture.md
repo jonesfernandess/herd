@@ -1,6 +1,6 @@
 # Herd Architecture
 
-This document describes the current runtime architecture of Herd as implemented today.
+Herd is an experiment platform for agent collaboration: explicit message channels, visible local-network discovery, and a Root agent that can coordinate a shared canvas. This document describes the current runtime architecture that makes that model work.
 
 It focuses on the concepts that matter when you are changing behavior or debugging the system:
 
@@ -68,7 +68,6 @@ Herd currently renders these tile kinds:
 - Root Agent
 - Browser
 - Work
-- Output
 
 Terminal-backed tiles map to a tmux window and primary pane. Work tiles are registry-backed and do not map to tmux panes.
 
@@ -76,12 +75,15 @@ Important identity fields:
 
 - `tile_id`
   - canonical tile identity used in the network graph
-  - pane-backed tiles use pane ids such as `%7`
+  - assigned by Herd, not by tmux
+  - tmux-backed tiles use short mixed-case Herd ids such as `AbCdEf`
   - work tiles use synthetic ids such as `work:work-s4-001`
 - `window_id`
   - tmux window id when applicable
 - `session_id`
   - the containing tmux session/tab
+
+Herd keeps the backing `tile_id -> tmux window/pane` mapping internally. Public control APIs target `tile_id`; tmux pane ids are implementation detail used for reconciliation and runtime operations.
 
 ## Lineage vs Networks
 
@@ -140,7 +142,7 @@ Each port has a mode:
 
 Current port rules:
 
-- Agent, Root Agent, Shell, Output
+- Agent, Root Agent, Shell
   - all 4 ports are `read_write`
 - Work, Browser
   - `left = read_write`
@@ -206,7 +208,11 @@ Workers are normal session agents.
 
 Properties:
 
-- message-oriented MCP surface
+- worker-safe local-network MCP surface
+- browser tile automation through `network_call` with browser action `drive`
+- visible local-network tiles may be inspected through `network_list` / `network_get`
+- direct control is limited to worker-safe `shell` and `browser` actions
+- `agent` and `root_agent` tiles stay read-only on the network, even when directly connected
 - no direct access to privileged Herd actions through MCP
 - expected to ask Root for privileged actions
 
@@ -229,8 +235,9 @@ Workers get:
 - `message_public`
 - `message_network`
 - `message_root`
-- `sudo`
 - `network_list`
+- `network_get`
+- `network_call`
 
 ### Root MCP surface
 
@@ -238,7 +245,7 @@ Root gets the worker tools plus the full session control surface:
 
 - shell tools
 - browser tools
-- agent and topic listing
+- topic listing and session-scoped tile discovery
 - session and network mutation tools
 - work inspection and work-stage tools
 
@@ -249,6 +256,9 @@ The MCP tool restriction is not the only guardrail. The Rust socket backend also
 Meaning:
 
 - workers should not be able to gain privileged behavior by bypassing MCP and talking to the socket directly as agents
+- workers may inspect visible local-network tiles, but the callable network surface is filtered by tile kind and network access
+- workers may control `shell` and eligible `browser` tiles through the worker-safe generic tile-message subset
+- `agent` and `root_agent` tiles remain observational only on the network
 - privileged session mutations still require Root or user-originated paths
 
 ## Messaging Model
@@ -306,7 +316,7 @@ Root messages go only to the current session Root agent.
 - socket command: `message_root`
 - CLI: `herd message root ...`
 - MCP: `message_root`
-- alias: `sudo`
+- CLI alias: `sudo`
 - chatter display: `Sender -> Root: message`
 
 ### Sender identities
@@ -394,11 +404,7 @@ Stages are ordered:
 - `prd`
 - `artifact`
 
-Each stage has a markdown workspace file:
-
-- `work/session-<n>/<work-id>/plan.md`
-- `work/session-<n>/<work-id>/prd.md`
-- `work/session-<n>/<work-id>/artifact.md`
+Each stage has SQLite-backed markdown content stored alongside its workflow state.
 
 ### Statuses
 
@@ -438,14 +444,15 @@ Herd persists runtime state in SQLite under the repo `tmp/` directory:
 SQLite stores:
 
 - tile/layout state
+- stable tile registry and tmux backing metadata
 - agent registry
 - topics
 - chatter
 - agent logs
-- work metadata
+- work metadata and stage content
 - network connections
 
-On-disk markdown files under `work/` store the editable work-stage content, but SQLite remains the source of truth for registry metadata and workflow status.
+There is no separate persisted `work/` content directory in the current runtime model; work stage documents live in SQLite.
 
 ## UI Surfaces
 
@@ -482,7 +489,7 @@ The sidebar is compact and selection-oriented. The canvas is the detailed spatia
 1. Worker receives a message over the Claude channel.
 2. Worker interprets the message kind and `replay` flag.
 3. Worker replies with Herd message tools, not plain assistant text, if the reply should be visible.
-4. If the task requires privileged Herd operations, the worker escalates to Root with `message_root` or `sudo`.
+4. If the task requires privileged Herd operations, the worker escalates to Root with `message_root`.
 
 ### Work ownership
 

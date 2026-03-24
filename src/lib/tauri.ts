@@ -113,8 +113,14 @@ export async function spawnAgentWindow(targetSessionId?: string | null): Promise
   return invoke('spawn_agent_window', { targetSessionId: targetSessionId ?? null });
 }
 
-export async function spawnBrowserWindow(targetSessionId?: string | null): Promise<string> {
-  return invoke<string>('spawn_browser_window', { targetSessionId: targetSessionId ?? null });
+export async function spawnBrowserWindow(
+  targetSessionId?: string | null,
+  browserIncognito?: boolean | null,
+): Promise<string> {
+  return invoke<string>('spawn_browser_window', {
+    targetSessionId: targetSessionId ?? null,
+    browserIncognito: browserIncognito ?? null,
+  });
 }
 
 export async function syncBrowserWebview(
@@ -200,6 +206,10 @@ export async function saveLayoutState(
 
 export async function tmuxStatus(): Promise<{ server: boolean; cc: boolean }> {
   return invoke<{ server: boolean; cc: boolean }>('tmux_status');
+}
+
+export async function clearDebugLogs(): Promise<void> {
+  return invoke('clear_debug_logs');
 }
 
 export async function setTestDriverState(options: {
